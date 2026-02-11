@@ -23,8 +23,8 @@ module Firebase.Auth.Types
   )
 where
 
+import Control.Concurrent.STM (TVar)
 import Crypto.JOSE.JWK (JWKSet)
-import Data.IORef (IORef)
 import Data.Text (Text)
 import Data.Time (NominalDiffTime, UTCTime)
 import Network.HTTP.Client (Manager)
@@ -82,9 +82,10 @@ data AuthError
 --
 -- Create with 'Firebase.Auth.newKeyCache'. Keys are refreshed automatically
 -- when expired (per Google's @Cache-Control: max-age@ header).
+-- Thread-safe via STM — concurrent verifications compose atomically.
 data KeyCache = KeyCache
-  { -- | Cached JWK set and its expiry time.
-    kcKeysRef :: !(IORef (JWKSet, UTCTime)),
+  { -- | Cached JWK set and its expiry time (STM for atomic concurrent access).
+    kcKeysRef :: !(TVar (JWKSet, UTCTime)),
     -- | HTTP manager for fetching keys from Google.
     kcManager :: !Manager
   }

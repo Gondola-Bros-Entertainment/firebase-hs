@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StrictData #-}
 
@@ -41,6 +42,8 @@ module Firebase.Auth
   )
 where
 
+import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Exception (evaluate)
 import Control.Lens (view, (&), (.~))
 import Control.Monad.Trans.Except (ExceptT, runExceptT, withExceptT)
 import Crypto.JOSE.Error (Error)
@@ -64,7 +67,6 @@ import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
-import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.String (fromString)
 import qualified Data.Text as T
 import Data.Time (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
@@ -152,7 +154,7 @@ verifyIdToken mgr config token = do
 newKeyCache :: Manager -> IO KeyCache
 newKeyCache mgr = do
   epoch <- getCurrentTime
-  ref <- newIORef (JWKSet [], epoch)
+  ref <- newTVarIO (JWKSet [], epoch)
   pure
     KeyCache
       { kcKeysRef = ref,
@@ -177,7 +179,7 @@ verifyIdTokenCached ::
   IO (Either AuthError FirebaseUser)
 verifyIdTokenCached cache config token = do
   now <- getCurrentTime
-  (jwks, expiry) <- readIORef (kcKeysRef cache)
+  (jwks, expiry) <- readTVarIO (kcKeysRef cache)
   keysResult <-
     if now >= expiry
       then do
@@ -185,7 +187,7 @@ verifyIdTokenCached cache config token = do
         case result of
           Left err -> pure (Left err)
           Right (newKeys, newExpiry) -> do
-            writeIORef (kcKeysRef cache) (newKeys, newExpiry)
+            atomically $ writeTVar (kcKeysRef cache) (newKeys, newExpiry)
             pure (Right newKeys)
       else pure (Right jwks)
   case keysResult of
@@ -209,7 +211,11 @@ fetchGoogleKeys mgr = do
       expiry = addUTCTime duration now
   case Aeson.eitherDecode body of
     Left err -> pure (Left (KeyFetchError (T.pack err)))
-    Right jwks -> pure (Right (jwks, expiry))
+    Right jwks -> do
+      -- Force the decoded JWKSet to WHNF so verification doesn't pay
+      -- deferred parse cost on the hot path.
+      !_ <- evaluate jwks
+      pure (Right (jwks, expiry))
 
 -- | Parse the @max-age@ directive from a @Cache-Control@ response header.
 --
