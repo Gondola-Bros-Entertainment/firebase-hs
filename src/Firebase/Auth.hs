@@ -43,7 +43,7 @@ module Firebase.Auth
 where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
-import Control.Exception (evaluate)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Lens (view, (&), (.~))
 import Control.Monad.Trans.Except (ExceptT, runExceptT, withExceptT)
 import Crypto.JOSE.Error (Error)
@@ -73,6 +73,7 @@ import Data.Time (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
 import Firebase.Auth.Types
 import Network.HTTP.Client
   ( Manager,
+    Response,
     httpLbs,
     parseRequest,
     responseBody,
@@ -203,19 +204,22 @@ verifyIdTokenCached cache config token = do
 fetchGoogleKeys :: Manager -> IO (Either AuthError (JWKSet, UTCTime))
 fetchGoogleKeys mgr = do
   req <- parseRequest googleJwkUrl
-  resp <- httpLbs req mgr
-  now <- getCurrentTime
-  let body = responseBody resp
-      maxAge = parseCacheMaxAge (responseHeaders resp)
-      duration = maybe defaultCacheDurationSeconds fromIntegral maxAge
-      expiry = addUTCTime duration now
-  case Aeson.eitherDecode body of
-    Left err -> pure (Left (KeyFetchError (T.pack err)))
-    Right jwks -> do
-      -- Force the decoded JWKSet to WHNF so verification doesn't pay
-      -- deferred parse cost on the hot path.
-      !_ <- evaluate jwks
-      pure (Right (jwks, expiry))
+  respResult <- try (httpLbs req mgr) :: IO (Either SomeException (Response LBS.ByteString))
+  case respResult of
+    Left err -> pure (Left (KeyFetchError (T.pack (show err))))
+    Right resp -> do
+      now <- getCurrentTime
+      let body = responseBody resp
+          maxAge = parseCacheMaxAge (responseHeaders resp)
+          duration = maybe defaultCacheDurationSeconds fromIntegral maxAge
+          expiry = addUTCTime duration now
+      case Aeson.eitherDecode body of
+        Left err -> pure (Left (KeyFetchError (T.pack err)))
+        Right jwks -> do
+          -- Force the decoded JWKSet to WHNF so verification doesn't pay
+          -- deferred parse cost on the hot path.
+          !_ <- evaluate jwks
+          pure (Right (jwks, expiry))
 
 -- | Parse the @max-age@ directive from a @Cache-Control@ response header.
 --

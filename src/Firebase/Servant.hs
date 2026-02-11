@@ -35,8 +35,6 @@ where
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
-import qualified Data.Text as T
-import Data.Text.Encoding (encodeUtf8)
 import Firebase.Auth (verifyIdTokenCached)
 import Firebase.Auth.Types (AuthError (..), FirebaseConfig, FirebaseUser, KeyCache)
 import Network.Wai (Request, requestHeaders)
@@ -90,14 +88,13 @@ extractBearerToken req = do
     then Just (BS.drop bearerPrefixLen hdr)
     else Nothing
 
--- | Convert an 'AuthError' to a human-readable lazy bytestring for error bodies.
+-- | Convert an 'AuthError' to a safe response message.
+--
+-- Internal details (JOSE errors, claim specifics) are hidden to prevent
+-- information leakage. Matches the error messages used by 'Firebase.Auth.WAI'.
 authErrorToBody :: AuthError -> LBS.ByteString
-authErrorToBody (KeyFetchError msg) = "Key fetch error: " <> textToLBS msg
+authErrorToBody (KeyFetchError _) = "Authentication service unavailable"
 authErrorToBody InvalidSignature = "Invalid token signature"
 authErrorToBody TokenExpired = "Token expired"
-authErrorToBody (InvalidClaims msg) = "Invalid claims: " <> textToLBS msg
-authErrorToBody (MalformedToken msg) = "Malformed token: " <> textToLBS msg
-
--- | Encode 'Text' to a lazy UTF-8 'LBS.ByteString'.
-textToLBS :: T.Text -> LBS.ByteString
-textToLBS = LBS.fromStrict . encodeUtf8
+authErrorToBody (InvalidClaims _) = "Invalid token claims"
+authErrorToBody (MalformedToken _) = "Malformed token"

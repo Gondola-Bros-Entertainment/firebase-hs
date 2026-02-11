@@ -41,13 +41,16 @@ module Firebase.Firestore
     rollbackTransaction,
     runTransaction,
 
+    -- * HTTP Manager
+    newTlsManager,
+
     -- * Re-exports
     module Firebase.Firestore.Types,
     module Firebase.Firestore.Query,
   )
 where
 
-import Control.Exception (IOException, try)
+import Control.Exception (SomeException, try)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KM
@@ -72,6 +75,7 @@ import Network.HTTP.Client
     responseBody,
     responseStatus,
   )
+import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Status (statusCode)
 
 -- ---------------------------------------------------------------------------
@@ -273,7 +277,7 @@ doRequest ::
   Maybe LBS.ByteString ->
   IO (Either FirestoreError LBS.ByteString)
 doRequest mgr tok url httpMethod mBody = do
-  reqResult <- try (parseRequest url) :: IO (Either IOException Request)
+  reqResult <- try (parseRequest url) :: IO (Either SomeException Request)
   case reqResult of
     Left err -> pure (Left (NetworkError (T.pack (show err))))
     Right baseReq -> do
@@ -288,7 +292,7 @@ doRequest mgr tok url httpMethod mBody = do
                 }
       respResult <-
         try (httpLbs req mgr) ::
-          IO (Either IOException (Response LBS.ByteString))
+          IO (Either SomeException (Response LBS.ByteString))
       case respResult of
         Left err -> pure (Left (NetworkError (T.pack (show err))))
         Right resp ->

@@ -3,7 +3,6 @@
 module Main (main) where
 
 import qualified Data.Aeson as Aeson
-import qualified Data.ByteString.Lazy as LBS
 import Data.Function ((&))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -60,6 +59,7 @@ main = do
         test "queryUrl builds correct URL" testQueryUrl,
         test "beginTransactionUrl builds correct URL" testBeginTransactionUrl,
         test "commitUrl builds correct URL" testCommitUrl,
+        test "rollbackUrl builds correct URL" testRollbackUrl,
         -- Firestore: Query DSL
         test "query encodes basic collection" testQueryBasic,
         test "query encodes with field filter" testQueryWithFilter,
@@ -231,7 +231,8 @@ testMapValueRoundtrip =
 testIntegerEncodesAsString :: IO Bool
 testIntegerEncodesAsString =
   let encoded = Aeson.encode (IntegerValue 42)
-   in assertBool "contains string \"42\"" ("\"42\"" `LBS.isPrefixOf` LBS.drop 1 (LBS.dropWhile (/= 58) encoded))
+      expected = Aeson.encode (Aeson.object ["integerValue" Aeson..= ("42" :: Text)])
+   in assertEqual "integer encodes as string" expected encoded
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Document decoding
@@ -346,6 +347,13 @@ testCommitUrl =
     "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:commit"
     (commitUrl (ProjectId "myproj"))
 
+testRollbackUrl :: IO Bool
+testRollbackUrl =
+  assertEqual
+    "rollbackUrl"
+    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:rollback"
+    (rollbackUrl (ProjectId "myproj"))
+
 -- ---------------------------------------------------------------------------
 -- Firestore: Query DSL
 -- ---------------------------------------------------------------------------
@@ -418,7 +426,7 @@ testRetryWithEncode =
               Aeson..= Aeson.object
                 [ "readWrite"
                     Aeson..= Aeson.object
-                      ["retryTransaction" Aeson..= ("abc123" :: String)]
+                      ["retryTransaction" Aeson..= ("abc123" :: Text)]
                 ]
           ]
    in assertEqual "RetryWith" expected encoded
