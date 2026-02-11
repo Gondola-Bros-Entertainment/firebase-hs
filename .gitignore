@@ -1,0 +1,12 @@
+dist-newstyle/
+*.hi
+*.o
+*.dyn_hi
+*.dyn_o
+.ghc.environment.*
+cabal.project.local
+.DS_Store
+*.swp
+*.swo
+*~
+CLAUDE.md

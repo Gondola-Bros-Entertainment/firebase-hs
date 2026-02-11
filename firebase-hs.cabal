@@ -1,0 +1,66 @@
+cabal-version:      3.0
+name:               firebase-hs
+version:            0.1.0.0
+synopsis:           Firebase Auth JWT verification and Firestore client for Haskell
+description:
+  Verify Firebase Authentication ID tokens (JWTs) in Haskell applications.
+  Fetches and caches Google's public keys, validates token signatures and
+  claims per Firebase's verification rules.
+
+license:            MIT
+license-file:       LICENSE
+author:             Devon Tomlin
+maintainer:         devon.tomlin@novavero.ai
+homepage:           https://github.com/Gondola-Bros-Entertainment/firebase-hs
+bug-reports:        https://github.com/Gondola-Bros-Entertainment/firebase-hs/issues
+category:           Web, Authentication
+stability:          experimental
+build-type:         Simple
+tested-with:        GHC == 9.6.7
+extra-doc-files:
+    CHANGELOG.md
+
+library
+  exposed-modules:
+    Firebase.Auth
+    Firebase.Auth.Types
+
+  build-depends:
+      base             >= 4.17 && < 5
+    , aeson            >= 2.0 && < 2.3
+    , bytestring       >= 0.11 && < 0.13
+    , containers       >= 0.6 && < 0.8
+    , http-client      >= 0.7 && < 0.8
+    , http-client-tls  >= 0.3 && < 0.4
+    , http-types       >= 0.12 && < 0.13
+    , jose             >= 0.11 && < 0.13
+    , lens             >= 5.0 && < 5.4
+    , text             >= 2.0 && < 2.2
+    , time             >= 1.12 && < 1.15
+    , transformers     >= 0.5 && < 0.7
+
+  hs-source-dirs:   src
+  default-language:  Haskell2010
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+
+test-suite firebase-hs-test
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  hs-source-dirs:   test
+  build-depends:
+      base             >= 4.17 && < 5
+    , bytestring       >= 0.11 && < 0.13
+    , firebase-hs
+    , http-types       >= 0.12 && < 0.13
+    , text             >= 2.0 && < 2.2
+  default-language:  Haskell2010
+  ghc-options:       -Wall -Wcompat
+
+source-repository head
+  type:     git
+  location: https://github.com/Gondola-Bros-Entertainment/firebase-hs
+  branch:   main
