@@ -4,9 +4,10 @@ version:            0.2.0.0
 synopsis:           Firebase Auth, Firestore, and Servant integration for Haskell
 description:
   Firebase Authentication (JWT verification), Firestore REST API client
-  (CRUD, queries, transactions), and an optional Servant auth combinator.
-  Verify ID tokens against Google's public keys, read and write Firestore
-  documents, and protect Servant endpoints — all from pure, composable Haskell.
+  (CRUD, queries, transactions), and optional WAI middleware and Servant
+  auth combinator. Verify ID tokens against Google's public keys, read and
+  write Firestore documents, and protect any Haskell web server with Firebase
+  auth — all from pure, composable Haskell.
 
 license:            MIT
 license-file:       LICENSE
@@ -20,6 +21,11 @@ build-type:         Simple
 tested-with:        GHC == 9.6.7
 extra-doc-files:
     CHANGELOG.md
+
+flag wai
+  description: Enable WAI auth middleware (Firebase.Auth.WAI)
+  default:     False
+  manual:      True
 
 flag servant
   description: Enable Servant auth combinator (Firebase.Servant)
@@ -49,6 +55,12 @@ library
     , text             >= 2.0 && < 2.2
     , time             >= 1.12 && < 1.15
     , transformers     >= 0.5 && < 0.7
+
+  if flag(wai)
+    exposed-modules: Firebase.Auth.WAI
+    build-depends:
+        vault            >= 0.3 && < 0.4
+      , wai              >= 3.2 && < 3.3
 
   if flag(servant)
     exposed-modules: Firebase.Servant
