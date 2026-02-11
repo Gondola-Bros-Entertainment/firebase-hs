@@ -15,6 +15,13 @@
 - `TransactionMode` sum type: `ReadWrite`, `RetryWith`, `ReadOnly`
 - `TransactionAborted` error variant for contention detection
 
+### WAI Auth Middleware (optional)
+- `requireAuth` — simple gate middleware, rejects unauthenticated requests
+- `firebaseAuth` — vault-based middleware, propagates `FirebaseUser` to handlers
+- `lookupFirebaseUser` — retrieve authenticated user from WAI vault
+- Gated behind `wai` cabal flag (default off)
+- Works with Warp, Scotty, Yesod, Spock, and any WAI-based framework
+
 ### Servant Auth Combinator (optional)
 - `firebaseAuthHandler` — one-liner Firebase auth for Servant servers
 - Gated behind `servant` cabal flag (default off, zero extra deps)

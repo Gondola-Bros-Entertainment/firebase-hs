@@ -182,6 +182,47 @@ Note: integers are encoded as JSON strings (`{"integerValue":"42"}`), not number
 
 ---
 
+## WAI Middleware
+
+Protect any WAI-based server (Warp, Scotty, Yesod, Spock) with Firebase auth. Enable with the `wai` cabal flag:
+
+```cabal
+build-depends: firebase-hs
+flags: +wai
+```
+
+### Simple Gate
+
+Reject unauthenticated requests before they reach your app:
+
+```haskell
+import Firebase.Auth (newTlsKeyCache, defaultFirebaseConfig)
+import Firebase.Auth.WAI (requireAuth)
+import Network.Wai.Handler.Warp (run)
+
+main :: IO ()
+main = do
+  cache <- newTlsKeyCache
+  let cfg = defaultFirebaseConfig "my-project-id"
+  run 3000 $ requireAuth cache cfg myApp
+```
+
+### With User Propagation
+
+Store the authenticated user in the WAI vault for downstream handlers:
+
+```haskell
+import Firebase.Auth.WAI (firebaseAuth, lookupFirebaseUser)
+
+main = run 3000 $ firebaseAuth cache cfg myApp
+
+myHandler req respond = case lookupFirebaseUser req of
+  Just user -> respond (ok200 ("Hello, " <> fuUid user))
+  Nothing   -> respond (err500 "unreachable")
+```
+
+---
+
 ## Servant
 
 Enable with the `servant` cabal flag:
@@ -241,6 +282,14 @@ rollbackTransaction :: Manager -> AccessToken -> ProjectId -> TransactionId -> I
 runTransaction      :: Manager -> AccessToken -> ProjectId -> TransactionMode -> (TransactionId -> IO (Either FirestoreError [Value])) -> IO (Either FirestoreError ())
 ```
 
+### WAI Middleware
+
+```haskell
+requireAuth        :: KeyCache -> FirebaseConfig -> Middleware
+firebaseAuth       :: KeyCache -> FirebaseConfig -> Middleware
+lookupFirebaseUser :: Request -> Maybe FirebaseUser
+```
+
 ### Servant
 
 ```haskell
@@ -259,6 +308,7 @@ Full Haddock documentation is available on [Hackage](https://hackage.haskell.org
 cabal build                              # Build library
 cabal test                               # Run all tests (40 pure tests)
 cabal build --ghc-options="-Werror"      # Warnings as errors
+cabal build -f wai                       # Build with WAI middleware
 cabal build -f servant                   # Build with Servant combinator
 cabal haddock                            # Generate docs
 ```
