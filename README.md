@@ -30,16 +30,13 @@ A pure Haskell library for Firebase services:
 Add to your `.cabal` file:
 
 ```cabal
-build-depends:
-    firebase-hs
-  , http-client-tls
+build-depends: firebase-hs
 ```
 
 ### Verify a Token
 
 ```haskell
 import Firebase.Auth
-import Network.HTTP.Client.TLS (newTlsManager)
 
 main :: IO ()
 main = do
@@ -91,7 +88,6 @@ case result of
 
 ```haskell
 import Firebase.Firestore
-import Network.HTTP.Client.TLS (newTlsManager)
 
 main :: IO ()
 main = do
@@ -186,9 +182,8 @@ Note: integers are encoded as JSON strings (`{"integerValue":"42"}`), not number
 
 Protect any WAI-based server (Warp, Scotty, Yesod, Spock) with Firebase auth. Enable with the `wai` cabal flag:
 
-```cabal
-build-depends: firebase-hs
-flags: +wai
+```bash
+cabal build -f wai
 ```
 
 ### Simple Gate
@@ -227,9 +222,8 @@ myHandler req respond = case lookupFirebaseUser req of
 
 Enable with the `servant` cabal flag:
 
-```cabal
-build-depends: firebase-hs
-flags: +servant
+```bash
+cabal build -f servant
 ```
 
 One-liner auth for any Servant server:

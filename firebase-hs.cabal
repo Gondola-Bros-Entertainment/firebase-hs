@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               firebase-hs
-version:            0.2.0.0
+version:            0.1.0.0
 synopsis:           Firebase Auth, Firestore, and Servant integration for Haskell
 description:
   Firebase Authentication (JWT verification), Firestore REST API client
@@ -21,6 +21,7 @@ build-type:         Simple
 tested-with:        GHC == 9.6.7
 extra-doc-files:
     CHANGELOG.md
+    README.md
 
 flag wai
   description: Enable WAI auth middleware (Firebase.Auth.WAI)

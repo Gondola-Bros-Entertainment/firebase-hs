@@ -67,7 +67,11 @@ newtype DocumentId = DocumentId {unDocumentId :: Text}
 
 -- | OAuth2 access token for authenticating Firestore requests.
 newtype AccessToken = AccessToken {unAccessToken :: BS.ByteString}
-  deriving (Eq, Show)
+  deriving (Eq)
+
+-- | Redacted to prevent credential leakage in logs and error messages.
+instance Show AccessToken where
+  show _ = "AccessToken <redacted>"
 
 -- | Full path to a document: collection + document ID.
 data DocumentPath = DocumentPath
@@ -82,7 +86,11 @@ data DocumentPath = DocumentPath
 
 -- | Opaque transaction identifier returned by Firestore.
 newtype TransactionId = TransactionId {unTransactionId :: Text}
-  deriving (Eq, Show)
+  deriving (Eq)
+
+-- | Redacted to prevent token leakage in logs and error messages.
+instance Show TransactionId where
+  show _ = "TransactionId <redacted>"
 
 -- | How to begin a Firestore transaction.
 data TransactionMode

@@ -13,12 +13,10 @@
 --
 -- @
 -- import Firebase.Auth
--- import Network.HTTP.Client.TLS (newTlsManager)
 --
 -- main :: IO ()
 -- main = do
---   mgr   <- newTlsManager
---   cache <- newKeyCache mgr
+--   cache <- newTlsKeyCache
 --   let cfg = defaultFirebaseConfig \"my-project-id\"
 --   result <- verifyIdTokenCached cache cfg someJwtBytes
 --   case result of

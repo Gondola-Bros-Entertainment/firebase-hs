@@ -12,7 +12,6 @@
 --
 -- @
 -- import Firebase.Firestore
--- import Network.HTTP.Client.TLS (newTlsManager)
 --
 -- main :: IO ()
 -- main = do

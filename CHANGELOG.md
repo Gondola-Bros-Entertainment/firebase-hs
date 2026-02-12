@@ -1,6 +1,18 @@
 # Changelog
 
-## 0.2.0.0
+## 0.1.0.0
+
+Initial release.
+
+### Auth
+- Firebase ID token (JWT) verification against Google's public keys
+- RS256 signature validation via jose's polymorphic `verifyJWT` with custom claims subtype
+- JWK-based key fetching with `Cache-Control: max-age` caching
+- STM-backed `KeyCache` for thread-safe concurrent verification
+- Strict JWKSet evaluation on fetch (zero deferred parse cost on hot path)
+- Convenience `newTlsKeyCache` constructor
+- Full claims validation: issuer, audience, expiry, issued-at, subject
+- Configurable clock skew (default 300s)
 
 ### Firestore REST API Client
 - CRUD operations: `getDocument`, `createDocument`, `updateDocument`, `deleteDocument`
@@ -29,17 +41,5 @@
 
 ### Internal
 - Pure URL builders and error parsers in `Firebase.Firestore.Internal` (fully testable)
-- 40 pure tests (up from 9): value roundtrips, document decoding, URL construction, query DSL, transaction encoding, error parsing
-
-## 0.1.0.0
-
-Initial release.
-
-- Firebase ID token (JWT) verification against Google's public keys
-- RS256 signature validation via jose's polymorphic `verifyJWT` with custom claims subtype
-- JWK-based key fetching with `Cache-Control: max-age` caching
-- STM-backed `KeyCache` for thread-safe concurrent verification
-- Strict JWKSet evaluation on fetch (zero deferred parse cost on hot path)
-- Convenience `newTlsKeyCache` constructor
-- Full claims validation: issuer, audience, expiry, issued-at, subject
-- Configurable clock skew (default 300s)
+- Redacted `Show` instances for `AccessToken` and `TransactionId` (no credential leakage)
+- 40 pure tests: value roundtrips, document decoding, URL construction, query DSL, transaction encoding, error parsing
