@@ -142,14 +142,11 @@ let q = query (CollectionPath "users")
 Read-then-write operations that succeed or fail atomically:
 
 ```haskell
-result <- runTransaction mgr tok pid ReadWrite $ \txnId -> do
+result <- runTransaction mgr tok pid ReadWrite $ \txnId -> runExceptT $ do
   -- Reads within the transaction see a consistent snapshot
-  doc <- getDocument mgr tok pid userPath
-  case doc of
-    Left err -> pure (Left err)
-    Right d  -> do
-      let newBalance = computeNewBalance (docFields d)
-      pure (Right [mkUpdateWrite userPath newBalance])
+  d <- ExceptT $ getDocument mgr tok pid userPath
+  let newBalance = computeNewBalance (docFields d)
+  pure [mkUpdateWrite userPath newBalance]
 ```
 
 Retry aborted transactions:

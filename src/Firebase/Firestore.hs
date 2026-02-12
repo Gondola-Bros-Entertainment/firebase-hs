@@ -50,6 +50,7 @@ module Firebase.Firestore
 where
 
 import Control.Exception (SomeException, try)
+import Control.Monad.Trans.Except (ExceptT (..), runExceptT)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KM
@@ -100,9 +101,8 @@ getDocument ::
   ProjectId ->
   DocumentPath ->
   IO (Either FirestoreError Document)
-getDocument mgr tok pid dp = do
-  result <- doGet mgr tok (documentUrl pid dp)
-  pure $ result >>= decodeDocument
+getDocument mgr tok pid dp =
+  fmap (>>= decodeDocument) (doGet mgr tok (documentUrl pid dp))
 
 -- | Create a document with a specific ID in a collection.
 createDocument ::
@@ -113,10 +113,9 @@ createDocument ::
   DocumentId ->
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
-createDocument mgr tok pid cp did fields = do
-  let body = Aeson.encode (Aeson.object ["fields" .= Aeson.toJSON fields])
-  result <- doPost mgr tok (createDocUrl pid cp did) body
-  pure $ result >>= decodeDocument
+createDocument mgr tok pid cp did fields =
+  let body = Aeson.encode (Aeson.object ["fields" .= fields])
+   in fmap (>>= decodeDocument) (doPost mgr tok (createDocUrl pid cp did) body)
 
 -- | Update a document's fields. Pass field names to update specific fields,
 -- or an empty list to replace all fields.
@@ -128,10 +127,9 @@ updateDocument ::
   [Text] ->
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
-updateDocument mgr tok pid dp fieldPaths fields = do
-  let body = Aeson.encode (Aeson.object ["fields" .= Aeson.toJSON fields])
-  result <- doPatch mgr tok (updateDocUrl pid dp fieldPaths) body
-  pure $ result >>= decodeDocument
+updateDocument mgr tok pid dp fieldPaths fields =
+  let body = Aeson.encode (Aeson.object ["fields" .= fields])
+   in fmap (>>= decodeDocument) (doPatch mgr tok (updateDocUrl pid dp fieldPaths) body)
 
 -- | Delete a document by path.
 deleteDocument ::
@@ -140,9 +138,8 @@ deleteDocument ::
   ProjectId ->
   DocumentPath ->
   IO (Either FirestoreError ())
-deleteDocument mgr tok pid dp = do
-  result <- doRequest mgr tok (documentUrl pid dp) "DELETE" Nothing
-  pure $ result >> Right ()
+deleteDocument mgr tok pid dp =
+  fmap (>> Right ()) (doRequest mgr tok (documentUrl pid dp) "DELETE" Nothing)
 
 -- ---------------------------------------------------------------------------
 -- Queries
@@ -155,10 +152,9 @@ runQuery ::
   ProjectId ->
   StructuredQuery ->
   IO (Either FirestoreError [Document])
-runQuery mgr tok pid sq = do
+runQuery mgr tok pid sq =
   let body = Aeson.encode (encodeQuery sq)
-  result <- doPost mgr tok (queryUrl pid) body
-  pure $ result >>= decodeQueryResults
+   in fmap (>>= decodeQueryResults) (doPost mgr tok (queryUrl pid) body)
 
 -- ---------------------------------------------------------------------------
 -- Transactions
@@ -171,10 +167,9 @@ beginTransaction ::
   ProjectId ->
   TransactionMode ->
   IO (Either FirestoreError TransactionId)
-beginTransaction mgr tok pid mode = do
+beginTransaction mgr tok pid mode =
   let body = Aeson.encode (encodeTransactionOptions mode)
-  result <- doPost mgr tok (beginTransactionUrl pid) body
-  pure $ result >>= decodeTransactionId
+   in fmap (>>= decodeTransactionId) (doPost mgr tok (beginTransactionUrl pid) body)
 
 -- | Commit a transaction with a list of write operations.
 commitTransaction ::
@@ -184,12 +179,11 @@ commitTransaction ::
   TransactionId ->
   [Aeson.Value] ->
   IO (Either FirestoreError ())
-commitTransaction mgr tok pid (TransactionId txnId) writes = do
+commitTransaction mgr tok pid (TransactionId txnId) writes =
   let body =
         Aeson.encode
           (Aeson.object ["writes" .= writes, "transaction" .= txnId])
-  result <- doPost mgr tok (commitUrl pid) body
-  pure $ result >> Right ()
+   in fmap (>> Right ()) (doPost mgr tok (commitUrl pid) body)
 
 -- | Roll back a transaction without committing.
 rollbackTransaction ::
@@ -198,10 +192,9 @@ rollbackTransaction ::
   ProjectId ->
   TransactionId ->
   IO (Either FirestoreError ())
-rollbackTransaction mgr tok pid (TransactionId txnId) = do
+rollbackTransaction mgr tok pid (TransactionId txnId) =
   let body = Aeson.encode (Aeson.object ["transaction" .= txnId])
-  result <- doPost mgr tok (rollbackUrl pid) body
-  pure $ result >> Right ()
+   in fmap (>> Right ()) (doPost mgr tok (rollbackUrl pid) body)
 
 -- | Run an atomic transaction. The callback receives the transaction ID
 -- and should return a list of writes to commit.
@@ -211,9 +204,9 @@ rollbackTransaction mgr tok pid (TransactionId txnId) = do
 -- Use 'RetryWith' to retry an aborted transaction.
 --
 -- @
--- runTransaction mgr tok pid ReadWrite $ \\txnId -> do
---   doc <- getDocument mgr tok pid somePath
---   pure [updateWrite, deleteWrite]
+-- runTransaction mgr tok pid ReadWrite $ \\txnId -> runExceptT $ do
+--   doc <- ExceptT $ getDocument mgr tok pid somePath
+--   pure [mkUpdateWrite somePath (docFields doc)]
 -- @
 runTransaction ::
   Manager ->
@@ -227,18 +220,14 @@ runTransaction mgr tok pid mode action = do
   case txnResult of
     Left err -> pure (Left err)
     Right txnId -> do
-      writesResult <- action txnId
-      case writesResult of
+      result <- runExceptT $ do
+        writes <- ExceptT $ action txnId
+        ExceptT $ commitTransaction mgr tok pid txnId writes
+      case result of
+        Right () -> pure (Right ())
         Left err -> do
           _ <- rollbackTransaction mgr tok pid txnId
           pure (Left err)
-        Right writes -> do
-          commitResult <- commitTransaction mgr tok pid txnId writes
-          case commitResult of
-            Left err -> do
-              _ <- rollbackTransaction mgr tok pid txnId
-              pure (Left err)
-            Right () -> pure (Right ())
 
 -- ---------------------------------------------------------------------------
 -- HTTP Helpers
