@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1.0
+
+### Fixed
+- Import `throwError` from `Control.Monad.Except` (mtl) instead of `Servant.Server` re-export for compatibility with newer servant versions
+- Add explicit `mtl` dependency under `servant` flag
+
 ## 0.1.0.0
 
 Initial release.

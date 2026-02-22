@@ -32,13 +32,14 @@ module Firebase.Servant
   )
 where
 
+import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (liftIO)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Firebase.Auth (verifyIdTokenCached)
 import Firebase.Auth.Types (AuthError (..), FirebaseConfig, FirebaseUser, KeyCache)
 import Network.Wai (Request, requestHeaders)
-import Servant.Server (Handler, err401, errBody, throwError)
+import Servant.Server (Handler, err401, errBody)
 import Servant.Server.Experimental.Auth (AuthHandler, mkAuthHandler)
 
 -- ---------------------------------------------------------------------------
