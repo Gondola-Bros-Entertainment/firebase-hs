@@ -15,72 +15,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build
-    needs: [lint, format]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: haskell-actions/setup@v2
-        with:
-          ghc-version: '9.8'
-          cabal-version: 'latest'
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.8-
-      - run: cabal build --only-dependencies
-      - run: cabal build
-
-  test:
-    name: Test
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: haskell-actions/setup@v2
-        with:
-          ghc-version: '9.8'
-          cabal-version: 'latest'
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.8-
-      - run: cabal test --enable-tests
-
-  warnings:
-    name: Warnings
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: haskell-actions/setup@v2
-        with:
-          ghc-version: '9.8'
-          cabal-version: 'latest'
-      - uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.8-
-      - run: cabal build --ghc-options="-Wall -Werror"
-
   lint:
     name: HLint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: haskell-actions/hlint-setup@v2
-        with:
-          version: '3.8'
       - uses: haskell-actions/hlint-run@v2
         with:
           path: '["src/", "test/"]'
@@ -99,7 +39,6 @@ jobs:
 
   cabal-check:
     name: Cabal Check
-    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -108,3 +47,27 @@ jobs:
           ghc-version: '9.8'
           cabal-version: 'latest'
       - run: cabal check
+
+  build:
+    name: Build (GHC ${{ matrix.ghc }})
+    needs: [lint, format, cabal-check]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ghc: ['9.8']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: 'latest'
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-ghc-${{ matrix.ghc }}-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: ${{ runner.os }}-ghc-${{ matrix.ghc }}-
+      - run: cabal update
+      - run: cabal build --ghc-options="-Werror"
+      - run: cabal test --enable-tests
