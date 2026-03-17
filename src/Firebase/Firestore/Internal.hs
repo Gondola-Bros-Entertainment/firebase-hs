@@ -35,6 +35,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
 import qualified Data.ByteString.Lazy as LBS
+import Data.List (intercalate)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -145,11 +146,7 @@ rollbackUrl pid =
 fieldMaskParams :: [Text] -> String
 fieldMaskParams [] = ""
 fieldMaskParams fs =
-  "?" <> intercalateAmp ["updateMask.fieldPaths=" <> T.unpack f | f <- fs]
-  where
-    intercalateAmp [] = ""
-    intercalateAmp [x] = x
-    intercalateAmp (x : xs) = x <> "&" <> intercalateAmp xs
+  "?" <> intercalate "&" ["updateMask.fieldPaths=" <> T.unpack f | f <- fs]
 
 -- ---------------------------------------------------------------------------
 -- Request Helpers

@@ -5,7 +5,6 @@ module Main (main) where
 import qualified Data.Aeson as Aeson
 import Data.Function ((&))
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, parseTimeOrError)
@@ -101,12 +100,6 @@ assertEqual label expected actual
   | otherwise = do
       putStrLn ("    " ++ label ++ ": expected " ++ show expected ++ ", got " ++ show actual)
       pure False
-
-assertBool :: String -> Bool -> IO Bool
-assertBool _ True = pure True
-assertBool label False = do
-  putStrLn ("    " ++ label ++ ": expected True")
-  pure False
 
 -- ---------------------------------------------------------------------------
 -- Auth: Config tests
@@ -375,8 +368,23 @@ testQueryWithFilter =
         encodeQuery $
           query (CollectionPath "users")
             & where_ (fieldFilter "age" OpGreaterThan (IntegerValue 18))
-      decoded = Aeson.decode (Aeson.encode q) :: Maybe Aeson.Value
-   in assertBool "has fieldFilter" (isJust decoded)
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
+                  "where"
+                    Aeson..= Aeson.object
+                      [ "fieldFilter"
+                          Aeson..= Aeson.object
+                            [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("age" :: Text)],
+                              "op" Aeson..= ("GREATER_THAN" :: Text),
+                              "value" Aeson..= Aeson.object ["integerValue" Aeson..= ("18" :: Text)]
+                            ]
+                      ]
+                ]
+          ]
+   in assertEqual "query with field filter" expected q
 
 testQueryWithOrderByLimit :: IO Bool
 testQueryWithOrderByLimit =
@@ -385,8 +393,21 @@ testQueryWithOrderByLimit =
           query (CollectionPath "users")
             & orderBy "name" Ascending
             & limit 25
-      decoded = Aeson.decode (Aeson.encode q) :: Maybe Aeson.Value
-   in assertBool "has orderBy and limit" (isJust decoded)
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
+                  "orderBy"
+                    Aeson..= [ Aeson.object
+                                 [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("name" :: Text)],
+                                   "direction" Aeson..= ("ASCENDING" :: Text)
+                                 ]
+                             ],
+                  "limit" Aeson..= (25 :: Int)
+                ]
+          ]
+   in assertEqual "query with orderBy and limit" expected q
 
 testQueryCompositeAnd :: IO Bool
 testQueryCompositeAnd =
@@ -399,8 +420,39 @@ testQueryCompositeAnd =
                     fieldFilter "active" OpEqual (BoolValue True)
                   ]
               )
-      decoded = Aeson.decode (Aeson.encode q) :: Maybe Aeson.Value
-   in assertBool "has compositeFilter" (isJust decoded)
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
+                  "where"
+                    Aeson..= Aeson.object
+                      [ "compositeFilter"
+                          Aeson..= Aeson.object
+                            [ "op" Aeson..= ("AND" :: Text),
+                              "filters"
+                                Aeson..= [ Aeson.object
+                                             [ "fieldFilter"
+                                                 Aeson..= Aeson.object
+                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("age" :: Text)],
+                                                     "op" Aeson..= ("GREATER_THAN" :: Text),
+                                                     "value" Aeson..= Aeson.object ["integerValue" Aeson..= ("18" :: Text)]
+                                                   ]
+                                             ],
+                                           Aeson.object
+                                             [ "fieldFilter"
+                                                 Aeson..= Aeson.object
+                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("active" :: Text)],
+                                                     "op" Aeson..= ("EQUAL" :: Text),
+                                                     "value" Aeson..= Aeson.object ["booleanValue" Aeson..= True]
+                                                   ]
+                                             ]
+                                         ]
+                            ]
+                      ]
+                ]
+          ]
+   in assertEqual "query with composite AND filter" expected q
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Transaction options encoding

@@ -46,6 +46,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Read as TR
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 
@@ -169,10 +170,11 @@ instance FromJSON FirestoreValue where
       _ -> fail "unrecognized FirestoreValue tag"
 
 -- | Parse an integer value from a JSON string (Firestore's wire format).
+-- Uses decimal-only parsing — rejects hex, octal, and other Haskell literals.
 parseIntegerValue :: Aeson.Value -> Parser Int64
 parseIntegerValue = Aeson.withText "integerValue" $ \t ->
-  case reads (T.unpack t) of
-    [(n, "")] -> pure n
+  case TR.signed TR.decimal t of
+    Right (n, remaining) | T.null remaining -> pure n
     _ -> fail ("invalid integerValue: " ++ T.unpack t)
 
 -- | Parse a timestamp from an RFC 3339 string.

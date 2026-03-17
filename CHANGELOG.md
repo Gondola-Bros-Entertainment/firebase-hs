@@ -17,7 +17,7 @@
 - Bumped GHC to 9.8.4, `base >= 4.19`
 - Widened `stm` bounds to `< 2.7`
 - Widened `text` bounds to `>= 1.2 && < 2.2`
-- Compatible with modern Haskell crypto stack (`crypton` + `ram`)
+- Compatible with modern Haskell crypto stack (`crypton`)
 
 ### Removed
 - `jose` dependency (source of `memory`/`ram` incompatibility)
