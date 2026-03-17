@@ -6,7 +6,7 @@
 -- |
 -- Module      : Firebase.Firestore.Types
 -- Description : Types for Firestore REST API
--- License     : MIT
+-- License     : BSD-3-Clause
 --
 -- Newtypes, value ADT, document, and error types for the Firestore REST API.
 -- 'FirestoreValue' uses custom JSON instances matching Firestore's tagged

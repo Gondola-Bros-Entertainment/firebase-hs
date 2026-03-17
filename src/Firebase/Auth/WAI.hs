@@ -4,7 +4,7 @@
 -- |
 -- Module      : Firebase.Auth.WAI
 -- Description : WAI middleware for Firebase authentication
--- License     : MIT
+-- License     : BSD-3-Clause
 --
 -- Firebase authentication middleware for any WAI-based web server.
 -- Works with Warp, Scotty, Yesod, Spock, and any other framework

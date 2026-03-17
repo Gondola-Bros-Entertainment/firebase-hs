@@ -4,7 +4,7 @@
 -- |
 -- Module      : Firebase.Auth.Types
 -- Description : Types for Firebase JWT verification
--- License     : MIT
+-- License     : BSD-3-Clause
 --
 -- Core data types for Firebase ID token verification: configuration,
 -- authenticated user, error reporting, and key caching.

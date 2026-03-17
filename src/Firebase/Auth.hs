@@ -5,7 +5,7 @@
 -- |
 -- Module      : Firebase.Auth
 -- Description : Firebase ID token verification
--- License     : MIT
+-- License     : BSD-3-Clause
 --
 -- Verify Firebase Authentication ID tokens (JWTs) against Google's
 -- public keys using crypton for RS256 signature verification.

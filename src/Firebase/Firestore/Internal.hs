@@ -4,7 +4,7 @@
 -- |
 -- Module      : Firebase.Firestore.Internal
 -- Description : Pure URL builders and request helpers for Firestore
--- License     : MIT
+-- License     : BSD-3-Clause
 --
 -- Internal utilities for constructing Firestore REST API URLs and requests.
 -- All functions are pure and testable without IO.
