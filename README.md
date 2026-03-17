@@ -7,8 +7,8 @@
 
 [![CI](https://github.com/Gondola-Bros-Entertainment/firebase-hs/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/firebase-hs/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/firebase-hs.svg)](https://hackage.haskell.org/package/firebase-hs)
-![Haskell](https://img.shields.io/badge/haskell-GHC%209.6-purple)
-![License](https://img.shields.io/badge/license-MIT-blue)
+![Haskell](https://img.shields.io/badge/haskell-GHC%209.8-purple)
+![License](https://img.shields.io/badge/license-BSD--3--Clause-blue)
 
 </p>
 </div>
@@ -19,7 +19,7 @@
 
 A pure Haskell library for Firebase services:
 
-- **Auth** — JWT verification against Google's public JWKs, with automatic key caching
+- **Auth** — JWT verification against Google's public JWKs using crypton for RS256, with automatic key caching
 - **Firestore** — CRUD operations, structured queries, and atomic transactions via the REST API
 - **Servant** — One-liner auth combinator for Servant servers (optional flag)
 
@@ -297,7 +297,7 @@ Full Haddock documentation is available on [Hackage](https://hackage.haskell.org
 
 ```bash
 cabal build                              # Build library
-cabal test                               # Run all tests (40 pure tests)
+cabal test                               # Run all tests (41 pure tests)
 cabal build --ghc-options="-Werror"      # Warnings as errors
 cabal build -f wai                       # Build with WAI middleware
 cabal build -f servant                   # Build with Servant combinator
@@ -307,5 +307,5 @@ cabal haddock                            # Generate docs
 ---
 
 <p align="center">
-  <sub>MIT License · <a href="https://github.com/Gondola-Bros-Entertainment">Gondola Bros Entertainment</a></sub>
+  <sub>BSD-3-Clause License · <a href="https://github.com/Gondola-Bros-Entertainment">Gondola Bros Entertainment</a></sub>
 </p>

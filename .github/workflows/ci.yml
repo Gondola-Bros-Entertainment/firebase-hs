@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_call:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -17,18 +20,18 @@ jobs:
     needs: [lint, format]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6.7'
-          cabal-version: '3.14'
-      - uses: actions/cache@v4
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-ghc-9.6.7-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.6.7-
+          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: ${{ runner.os }}-ghc-9.8-
       - run: cabal build --only-dependencies
       - run: cabal build
 
@@ -37,18 +40,18 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6.7'
-          cabal-version: '3.14'
-      - uses: actions/cache@v4
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-ghc-9.6.7-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.6.7-
+          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: ${{ runner.os }}-ghc-9.8-
       - run: cabal test --enable-tests
 
   warnings:
@@ -56,25 +59,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6.7'
-          cabal-version: '3.14'
-      - uses: actions/cache@v4
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-ghc-9.6.7-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.6.7-
+          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: ${{ runner.os }}-ghc-9.8-
       - run: cabal build --ghc-options="-Wall -Werror"
 
   lint:
     name: HLint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/hlint-setup@v2
         with:
           version: '3.8'
@@ -87,7 +90,7 @@ jobs:
     name: Ormolu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/run-ormolu@v16
         with:
           pattern: |
@@ -99,9 +102,9 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6.7'
-          cabal-version: '3.14'
+          ghc-version: '9.8'
+          cabal-version: 'latest'
       - run: cabal check

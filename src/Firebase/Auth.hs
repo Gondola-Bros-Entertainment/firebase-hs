@@ -8,8 +8,7 @@
 -- License     : MIT
 --
 -- Verify Firebase Authentication ID tokens (JWTs) against Google's
--- public keys. Supports both one-shot verification and cached key
--- stores for production servers.
+-- public keys using crypton for RS256 signature verification.
 --
 -- @
 -- import Firebase.Auth
@@ -42,32 +41,19 @@ where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (SomeException, evaluate, try)
-import Control.Lens (view, (&), (.~))
-import Control.Monad.Trans.Except (ExceptT, runExceptT, withExceptT)
-import Crypto.JOSE.Error (Error)
-import Crypto.JOSE.JWK (JWKSet (..))
-import Crypto.JWT
-  ( ClaimsSet,
-    HasClaimsSet (..),
-    JWTError (..),
-    JWTValidationSettings,
-    SignedJWT,
-    StringOrURI,
-    claimSub,
-    decodeCompact,
-    defaultJWTValidationSettings,
-    jwtValidationSettingsAllowedSkew,
-    jwtValidationSettingsIssuerPredicate,
-    verifyJWT,
-  )
-import Data.Aeson (FromJSON (..), (.:?))
+import Crypto.Hash.Algorithms (SHA256 (..))
+import Crypto.PubKey.RSA.PKCS15 (verify)
+import Crypto.PubKey.RSA.Types (PublicKey)
+import Data.Aeson (FromJSON (..), (.:), (.:?))
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64.URL as B64URL
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
-import Data.String (fromString)
+import Data.Text (Text)
 import qualified Data.Text as T
-import Data.Time (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime)
+import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Firebase.Auth.Types
 import Network.HTTP.Client
   ( Manager,
@@ -81,27 +67,38 @@ import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types.Header (ResponseHeaders, hCacheControl)
 
 -- ---------------------------------------------------------------------------
--- Firebase JWT claims (jose subtype pattern)
+-- JWT internal types
 -- ---------------------------------------------------------------------------
 
--- | JWT claims carrying both the standard 'ClaimsSet' and Firebase-specific
--- custom fields. This is the jose-recommended subtype approach: 'verifyJWT'
--- decodes and validates everything in one pass, with the types driving
--- which fields get extracted.
-data FirebaseClaims = FirebaseClaims
-  { _fcClaimsSet :: !ClaimsSet,
-    _fcEmail :: !(Maybe T.Text),
-    _fcName :: !(Maybe T.Text)
+data JwtHeader = JwtHeader
+  { jhAlg :: !Text,
+    jhKid :: !Text
   }
 
-instance HasClaimsSet FirebaseClaims where
-  claimsSet f (FirebaseClaims cs e n) =
-    (\cs' -> FirebaseClaims cs' e n) <$> f cs
+instance FromJSON JwtHeader where
+  parseJSON = Aeson.withObject "JwtHeader" $ \o ->
+    JwtHeader
+      <$> o .: "alg"
+      <*> o .: "kid"
 
-instance FromJSON FirebaseClaims where
-  parseJSON = Aeson.withObject "FirebaseClaims" $ \o ->
-    FirebaseClaims
-      <$> parseJSON (Aeson.Object o)
+data JwtPayload = JwtPayload
+  { jpSub :: !(Maybe Text),
+    jpIss :: !(Maybe Text),
+    jpAud :: !(Maybe Text),
+    jpExp :: !(Maybe Integer),
+    jpIat :: !(Maybe Integer),
+    jpEmail :: !(Maybe Text),
+    jpName :: !(Maybe Text)
+  }
+
+instance FromJSON JwtPayload where
+  parseJSON = Aeson.withObject "JwtPayload" $ \o ->
+    JwtPayload
+      <$> o .:? "sub"
+      <*> o .:? "iss"
+      <*> o .:? "aud"
+      <*> o .:? "exp"
+      <*> o .:? "iat"
       <*> o .:? "email"
       <*> o .:? "name"
 
@@ -109,18 +106,18 @@ instance FromJSON FirebaseClaims where
 -- Constants
 -- ---------------------------------------------------------------------------
 
--- | Google's JWK endpoint for Firebase token verification.
 googleJwkUrl :: String
 googleJwkUrl =
   "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
 
--- | Fallback cache duration when @Cache-Control@ header is missing (1 hour).
 defaultCacheDurationSeconds :: NominalDiffTime
 defaultCacheDurationSeconds = 3600
 
--- | Firebase issuer URL prefix. Full issuer is this plus the project ID.
-firebaseIssuerPrefix :: T.Text
+firebaseIssuerPrefix :: Text
 firebaseIssuerPrefix = "https://securetoken.google.com/"
+
+expectedAlgorithm :: Text
+expectedAlgorithm = "RS256"
 
 -- ---------------------------------------------------------------------------
 -- One-shot verification
@@ -128,12 +125,11 @@ firebaseIssuerPrefix = "https://securetoken.google.com/"
 
 -- | Verify a Firebase ID token, fetching Google's public keys fresh.
 --
--- For production servers handling many requests, prefer 'verifyIdTokenCached'
--- to avoid re-fetching keys on every call.
+-- For production servers, prefer 'verifyIdTokenCached' to avoid
+-- re-fetching keys on every call.
 verifyIdToken ::
   Manager ->
   FirebaseConfig ->
-  -- | Raw JWT bytes (compact serialization)
   BS.ByteString ->
   IO (Either AuthError FirebaseUser)
 verifyIdToken mgr config token = do
@@ -147,22 +143,13 @@ verifyIdToken mgr config token = do
 -- ---------------------------------------------------------------------------
 
 -- | Create a key cache backed by the given HTTP manager.
---
--- The manager must support HTTPS (e.g. from @Network.HTTP.Client.TLS@).
--- Keys are fetched lazily on first verification and refreshed when expired.
 newKeyCache :: Manager -> IO KeyCache
 newKeyCache mgr = do
   epoch <- getCurrentTime
-  ref <- newTVarIO (JWKSet [], epoch)
-  pure
-    KeyCache
-      { kcKeysRef = ref,
-        kcManager = mgr
-      }
+  ref <- newTVarIO (JwkSet [], epoch)
+  pure KeyCache {kcKeysRef = ref, kcManager = mgr}
 
 -- | Create a key cache with a fresh TLS-enabled HTTP manager.
---
--- Convenience wrapper around 'newKeyCache' for the common case.
 newTlsKeyCache :: IO KeyCache
 newTlsKeyCache = newTlsManager >>= newKeyCache
 
@@ -173,7 +160,6 @@ newTlsKeyCache = newTlsManager >>= newKeyCache
 verifyIdTokenCached ::
   KeyCache ->
   FirebaseConfig ->
-  -- | Raw JWT bytes (compact serialization)
   BS.ByteString ->
   IO (Either AuthError FirebaseUser)
 verifyIdTokenCached cache config token = do
@@ -197,9 +183,7 @@ verifyIdTokenCached cache config token = do
 -- Key fetching
 -- ---------------------------------------------------------------------------
 
--- | Fetch Google's public JWK set and compute the cache expiry from the
--- @Cache-Control: max-age@ response header.
-fetchGoogleKeys :: Manager -> IO (Either AuthError (JWKSet, UTCTime))
+fetchGoogleKeys :: Manager -> IO (Either AuthError (JwkSet, UTCTime))
 fetchGoogleKeys mgr = do
   req <- parseRequest googleJwkUrl
   respResult <- try (httpLbs req mgr) :: IO (Either SomeException (Response LBS.ByteString))
@@ -214,14 +198,10 @@ fetchGoogleKeys mgr = do
       case Aeson.eitherDecode body of
         Left err -> pure (Left (KeyFetchError (T.pack err)))
         Right jwks -> do
-          -- Force the decoded JWKSet to WHNF so verification doesn't pay
-          -- deferred parse cost on the hot path.
           !_ <- evaluate jwks
           pure (Right (jwks, expiry))
 
 -- | Parse the @max-age@ directive from a @Cache-Control@ response header.
---
--- Returns 'Nothing' if the header is absent or has no valid @max-age@ value.
 --
 -- >>> parseCacheMaxAge [("cache-control", "public, max-age=19845, must-revalidate")]
 -- Just 19845
@@ -244,83 +224,117 @@ parseCacheMaxAge headers = do
 -- JWT verification
 -- ---------------------------------------------------------------------------
 
--- | Verify a JWT against the given JWK set and Firebase configuration.
---
--- Uses jose's polymorphic 'verifyJWT' with our 'FirebaseClaims' subtype,
--- so signature verification, claims validation, and custom field extraction
--- all happen in a single type-directed pass.
 verifyWithKeys ::
-  JWKSet ->
+  JwkSet ->
   FirebaseConfig ->
   BS.ByteString ->
   IO (Either AuthError FirebaseUser)
 verifyWithKeys jwks config tokenBytes = do
-  let token = LBS.fromStrict tokenBytes
-      projectId = fcProjectId config
+  now <- getCurrentTime
+  pure $ do
+    (headerB64, payloadB64, sigBytes, header, payload) <- parseCompactJwt tokenBytes
+    validateAlgorithm header
+    pubKey <- findKeyByKid (jhKid header) jwks
+    verifySignature pubKey (headerB64 <> "." <> payloadB64) sigBytes
+    validateClaims config now payload
+    extractUser payload
+
+-- ---------------------------------------------------------------------------
+-- JWT parsing
+-- ---------------------------------------------------------------------------
+
+parseCompactJwt ::
+  BS.ByteString ->
+  Either AuthError (BS.ByteString, BS.ByteString, BS.ByteString, JwtHeader, JwtPayload)
+parseCompactJwt token =
+  case BS8.split '.' token of
+    [headerB64, payloadB64, sigB64] -> do
+      headerBytes <- decodeSegment "header" headerB64
+      payloadBytes <- decodeSegment "payload" payloadB64
+      sigBytes <- decodeSegment "signature" sigB64
+      header <- decodeJson "header" headerBytes
+      payload <- decodeJson "payload" payloadBytes
+      Right (headerB64, payloadB64, sigBytes, header, payload)
+    _ -> Left (MalformedToken "expected 3 dot-separated parts")
+
+decodeSegment :: Text -> BS.ByteString -> Either AuthError BS.ByteString
+decodeSegment label input =
+  case B64URL.decode (padBase64Url input) of
+    Left err -> Left (MalformedToken (label <> ": " <> T.pack err))
+    Right bs -> Right bs
+
+decodeJson :: (FromJSON a) => Text -> BS.ByteString -> Either AuthError a
+decodeJson label bytes =
+  case Aeson.eitherDecodeStrict bytes of
+    Left err -> Left (MalformedToken (label <> ": " <> T.pack err))
+    Right val -> Right val
+
+-- ---------------------------------------------------------------------------
+-- Signature verification
+-- ---------------------------------------------------------------------------
+
+validateAlgorithm :: JwtHeader -> Either AuthError ()
+validateAlgorithm header
+  | jhAlg header == expectedAlgorithm = Right ()
+  | otherwise = Left (MalformedToken ("unsupported algorithm: " <> jhAlg header))
+
+findKeyByKid :: Text -> JwkSet -> Either AuthError PublicKey
+findKeyByKid kid (JwkSet keys) =
+  case filter (\k -> jkKid k == kid) keys of
+    (matched : _) -> Right (jkKey matched)
+    [] -> Left InvalidSignature
+
+verifySignature :: PublicKey -> BS.ByteString -> BS.ByteString -> Either AuthError ()
+verifySignature pubKey signedData sigBytes
+  | verify (Just SHA256) pubKey signedData sigBytes = Right ()
+  | otherwise = Left InvalidSignature
+
+-- ---------------------------------------------------------------------------
+-- Claims validation
+-- ---------------------------------------------------------------------------
+
+validateClaims :: FirebaseConfig -> UTCTime -> JwtPayload -> Either AuthError ()
+validateClaims config now payload = do
+  let projectId = fcProjectId config
       expectedIssuer = firebaseIssuerPrefix <> projectId
-      settings = makeValidationSettings projectId expectedIssuer (fcClockSkew config)
-  result <- runExceptT $ do
-    jwt <-
-      withExceptT
-        mapDecodeError
-        (decodeCompact token :: ExceptT Error IO SignedJWT)
-    withExceptT
-      mapVerifyError
-      (verifyJWT settings jwks jwt :: ExceptT JWTError IO FirebaseClaims)
-  pure $ case result of
-    Left err -> Left err
-    Right fc -> toFirebaseUser fc
+      skew = fcClockSkew config
+  requireClaim "iss" (jpIss payload) (== expectedIssuer) (InvalidClaims "issuer mismatch")
+  requireClaim "aud" (jpAud payload) (== projectId) (InvalidClaims "audience mismatch")
+  requireExpiry skew now (jpExp payload)
+  requireIssuedAt skew now (jpIat payload)
 
--- | Build JWT validation settings for Firebase token verification.
---
--- Validates: audience = project ID, issuer = Firebase issuer URL,
--- expiry and issued-at within allowed clock skew.
-makeValidationSettings ::
-  T.Text -> T.Text -> NominalDiffTime -> JWTValidationSettings
-makeValidationSettings projectId expectedIssuer skew =
-  defaultJWTValidationSettings (== textToStringOrURI projectId)
-    & jwtValidationSettingsIssuerPredicate .~ (== textToStringOrURI expectedIssuer)
-    & jwtValidationSettingsAllowedSkew .~ skew
+requireClaim :: Text -> Maybe Text -> (Text -> Bool) -> AuthError -> Either AuthError ()
+requireClaim label mVal predicate err =
+  case mVal of
+    Just val | predicate val -> Right ()
+    Just _ -> Left err
+    Nothing -> Left (InvalidClaims ("missing " <> label <> " claim"))
 
--- | Convert verified 'FirebaseClaims' to a 'FirebaseUser'.
---
--- The @sub@ claim is guaranteed present by Firebase's token contract,
--- but we handle the missing case defensively.
-toFirebaseUser :: FirebaseClaims -> Either AuthError FirebaseUser
-toFirebaseUser fc = do
-  sub <- maybe (Left (InvalidClaims "missing sub claim")) Right (view claimSub fc)
-  uid <- maybe (Left (InvalidClaims "empty sub claim")) Right (stringOrUriToText sub)
-  Right
-    FirebaseUser
-      { fuUid = uid,
-        fuEmail = _fcEmail fc,
-        fuName = _fcName fc
-      }
+requireExpiry :: NominalDiffTime -> UTCTime -> Maybe Integer -> Either AuthError ()
+requireExpiry _skew _now Nothing = Left (InvalidClaims "missing exp claim")
+requireExpiry skew now (Just expSeconds)
+  | addUTCTime skew expTime >= now = Right ()
+  | otherwise = Left TokenExpired
+  where
+    expTime = posixSecondsToUTCTime (fromInteger expSeconds)
+
+requireIssuedAt :: NominalDiffTime -> UTCTime -> Maybe Integer -> Either AuthError ()
+requireIssuedAt _skew _now Nothing = Left (InvalidClaims "missing iat claim")
+requireIssuedAt skew now (Just iatSeconds)
+  | diffUTCTime iatTime now <= skew = Right ()
+  | otherwise = Left (InvalidClaims "token issued in the future")
+  where
+    iatTime = posixSecondsToUTCTime (fromInteger iatSeconds)
 
 -- ---------------------------------------------------------------------------
--- Helpers
+-- User extraction
 -- ---------------------------------------------------------------------------
 
--- | Convert 'Data.Text.Text' to jose 'StringOrURI' via the 'Data.String.IsString' instance.
-textToStringOrURI :: T.Text -> StringOrURI
-textToStringOrURI = fromString . T.unpack
-
--- | Extract text from a jose 'StringOrURI' by round-tripping through JSON.
-stringOrUriToText :: StringOrURI -> Maybe T.Text
-stringOrUriToText s = case Aeson.toJSON s of
-  Aeson.String t | not (T.null t) -> Just t
-  _ -> Nothing
-
--- | Map a JOSE decode error to 'AuthError'.
-mapDecodeError :: Error -> AuthError
-mapDecodeError = MalformedToken . T.pack . show
-
--- | Map a JWT verification error to 'AuthError'.
-mapVerifyError :: JWTError -> AuthError
-mapVerifyError JWTExpired = TokenExpired
-mapVerifyError JWTNotInAudience = InvalidClaims "audience mismatch"
-mapVerifyError JWTNotInIssuer = InvalidClaims "issuer mismatch"
-mapVerifyError JWTIssuedAtFuture = InvalidClaims "token issued in the future"
-mapVerifyError JWTNotYetValid = InvalidClaims "token not yet valid"
-mapVerifyError (JWTClaimsSetDecodeError msg) = MalformedToken (T.pack msg)
-mapVerifyError (JWSError _) = InvalidSignature
+extractUser :: JwtPayload -> Either AuthError FirebaseUser
+extractUser payload =
+  case jpSub payload of
+    Just sub
+      | not (T.null sub) ->
+          Right FirebaseUser {fuUid = sub, fuEmail = jpEmail payload, fuName = jpName payload}
+    Just _ -> Left (InvalidClaims "empty sub claim")
+    Nothing -> Left (InvalidClaims "missing sub claim")

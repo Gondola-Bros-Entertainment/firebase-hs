@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: true
@@ -18,7 +21,7 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set version from tag
         run: |
           TAG_VERSION=${GITHUB_REF#refs/tags/v}
@@ -26,8 +29,8 @@ jobs:
           echo "Set version to $TAG_VERSION"
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: '9.6.7'
-          cabal-version: '3.14'
+          ghc-version: '9.8'
+          cabal-version: 'latest'
       - run: cabal sdist
       - name: Upload to Hackage
         run: |
