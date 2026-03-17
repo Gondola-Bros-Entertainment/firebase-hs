@@ -30,7 +30,7 @@
 - WAI middleware (`Firebase.Auth.WAI`)
 - Servant combinator (`Firebase.Servant`)
 - Firestore client (all modules unchanged)
-- All 41 tests pass
+- All 46 tests pass
 
 ## 0.1.1.0
 

@@ -88,6 +88,7 @@ test-suite firebase-hs-test
     , bytestring       >= 0.11 && < 0.13
     , containers       >= 0.6  && < 0.8
     , firebase-hs
+    , http-client      >= 0.7  && < 0.8
     , http-types       >= 0.12 && < 0.13
     , text             >= 1.2  && < 2.2
     , time             >= 1.12 && < 1.15

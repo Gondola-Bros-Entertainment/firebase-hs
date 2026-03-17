@@ -4,6 +4,7 @@ module Main (main) where
 
 import qualified Data.Aeson as Aeson
 import Data.Function ((&))
+import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Time (UTCTime)
@@ -12,6 +13,7 @@ import Firebase.Auth
 import Firebase.Firestore.Internal
 import Firebase.Firestore.Query
 import Firebase.Firestore.Types
+import Network.HTTP.Client (parseRequest, requestHeaders)
 import Network.HTTP.Types.Header (hCacheControl)
 import System.Exit (exitFailure)
 
@@ -64,10 +66,16 @@ main = do
         test "query encodes with field filter" testQueryWithFilter,
         test "query encodes with orderBy and limit" testQueryWithOrderByLimit,
         test "query encodes composite AND filter" testQueryCompositeAnd,
+        test "query encodes composite OR filter" testQueryCompositeOr,
+        test "query encodes with offset" testQueryWithOffset,
+        test "query encodes Descending order" testQueryDescending,
+        test "all FilterOp values encode correctly" testAllFilterOpEncodings,
         -- Firestore: Transaction options encoding
         test "ReadWrite transaction options encode" testReadWriteEncode,
         test "RetryWith transaction options encode" testRetryWithEncode,
         test "ReadOnly transaction options encode" testReadOnlyEncode,
+        -- Firestore: Request helpers
+        test "authorizeRequest adds Bearer header" testAuthorizeRequest,
         -- Firestore: Error parsing
         test "parseFirestoreError 404" testParseError404,
         test "parseFirestoreError 403" testParseError403,
@@ -453,6 +461,130 @@ testQueryCompositeAnd =
                 ]
           ]
    in assertEqual "query with composite AND filter" expected q
+
+testQueryCompositeOr :: IO Bool
+testQueryCompositeOr =
+  let q =
+        encodeQuery $
+          query (CollectionPath "users")
+            & where_
+              ( compositeOr
+                  [ fieldFilter "role" OpEqual (StringValue "admin"),
+                    fieldFilter "role" OpEqual (StringValue "moderator")
+                  ]
+              )
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
+                  "where"
+                    Aeson..= Aeson.object
+                      [ "compositeFilter"
+                          Aeson..= Aeson.object
+                            [ "op" Aeson..= ("OR" :: Text),
+                              "filters"
+                                Aeson..= [ Aeson.object
+                                             [ "fieldFilter"
+                                                 Aeson..= Aeson.object
+                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("role" :: Text)],
+                                                     "op" Aeson..= ("EQUAL" :: Text),
+                                                     "value" Aeson..= Aeson.object ["stringValue" Aeson..= ("admin" :: Text)]
+                                                   ]
+                                             ],
+                                           Aeson.object
+                                             [ "fieldFilter"
+                                                 Aeson..= Aeson.object
+                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("role" :: Text)],
+                                                     "op" Aeson..= ("EQUAL" :: Text),
+                                                     "value" Aeson..= Aeson.object ["stringValue" Aeson..= ("moderator" :: Text)]
+                                                   ]
+                                             ]
+                                         ]
+                            ]
+                      ]
+                ]
+          ]
+   in assertEqual "query with composite OR filter" expected q
+
+testQueryWithOffset :: IO Bool
+testQueryWithOffset =
+  let q =
+        encodeQuery $
+          query (CollectionPath "items")
+            & offset 50
+            & limit 25
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("items" :: Text)]],
+                  "limit" Aeson..= (25 :: Int),
+                  "offset" Aeson..= (50 :: Int)
+                ]
+          ]
+   in assertEqual "query with offset" expected q
+
+testQueryDescending :: IO Bool
+testQueryDescending =
+  let q =
+        encodeQuery $
+          query (CollectionPath "posts")
+            & orderBy "createdAt" Descending
+      expected =
+        Aeson.object
+          [ "structuredQuery"
+              Aeson..= Aeson.object
+                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("posts" :: Text)]],
+                  "orderBy"
+                    Aeson..= [ Aeson.object
+                                 [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("createdAt" :: Text)],
+                                   "direction" Aeson..= ("DESCENDING" :: Text)
+                                 ]
+                             ]
+                ]
+          ]
+   in assertEqual "query with Descending order" expected q
+
+testAllFilterOpEncodings :: IO Bool
+testAllFilterOpEncodings =
+  let encodeOp op =
+        let q =
+              encodeQuery $
+                query (CollectionPath "c")
+                  & where_ (fieldFilter "f" op (StringValue "v"))
+         in Aeson.encode q
+      -- Each operator must produce a distinct, non-empty encoding
+      allEncodings = map encodeOp allOps
+      allOps =
+        [ OpEqual,
+          OpNotEqual,
+          OpLessThan,
+          OpLessThanOrEqual,
+          OpGreaterThan,
+          OpGreaterThanOrEqual,
+          OpArrayContains,
+          OpIn,
+          OpArrayContainsAny,
+          OpNotIn
+        ]
+      allDistinct = length allEncodings == length (nub allEncodings)
+   in do
+        r1 <- assertEqual "10 ops" 10 (length allOps)
+        r2 <- assertEqual "all distinct" True allDistinct
+        pure (r1 && r2)
+
+-- ---------------------------------------------------------------------------
+-- Firestore: Request helpers
+-- ---------------------------------------------------------------------------
+
+testAuthorizeRequest :: IO Bool
+testAuthorizeRequest = do
+  baseReq <- parseRequest "https://example.com"
+  let tok = AccessToken "test-token-123"
+      authorized = authorizeRequest tok baseReq
+      authHeader = lookup "Authorization" (requestHeaders authorized)
+  assertEqual "Authorization header" (Just "Bearer test-token-123") authHeader
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Transaction options encoding

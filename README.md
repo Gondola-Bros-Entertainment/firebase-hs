@@ -297,7 +297,7 @@ Full Haddock documentation is available on [Hackage](https://hackage.haskell.org
 
 ```bash
 cabal build                              # Build library
-cabal test                               # Run all tests (41 pure tests)
+cabal test                               # Run all tests (46 pure tests)
 cabal build --ghc-options="-Werror"      # Warnings as errors
 cabal build -f wai                       # Build with WAI middleware
 cabal build -f servant                   # Build with Servant combinator
