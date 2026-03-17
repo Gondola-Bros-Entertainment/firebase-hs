@@ -294,7 +294,7 @@ doRequest mgr tok url httpMethod mBody = do
 -- Response Decoders (pure)
 -- ---------------------------------------------------------------------------
 
--- | Decode a response body as a 'Document'.
+-- | Decode a response body as a t'Document'.
 decodeDocument :: LBS.ByteString -> Either FirestoreError Document
 decodeDocument body = case Aeson.eitherDecode body of
   Left err -> Left (InvalidResponse (T.pack err))

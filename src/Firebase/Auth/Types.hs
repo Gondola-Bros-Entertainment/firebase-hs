@@ -60,7 +60,7 @@ data FirebaseConfig = FirebaseConfig
 defaultClockSkewSeconds :: NominalDiffTime
 defaultClockSkewSeconds = 300
 
--- | Create a 'FirebaseConfig' with a 300-second clock skew allowance.
+-- | Create a t'FirebaseConfig' with a 300-second clock skew allowance.
 defaultFirebaseConfig ::
   -- | Firebase project ID
   Text ->

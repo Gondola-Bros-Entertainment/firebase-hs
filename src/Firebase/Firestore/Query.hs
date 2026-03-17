@@ -154,7 +154,7 @@ compositeOr = CompositeFilterF . CompositeFilter OpOr
 -- JSON Encoding
 -- ---------------------------------------------------------------------------
 
--- | Encode a 'StructuredQuery' to the JSON format expected by the
+-- | Encode a t'StructuredQuery' to the JSON format expected by the
 -- Firestore REST API's @:runQuery@ endpoint.
 encodeQuery :: StructuredQuery -> Aeson.Value
 encodeQuery sq =
