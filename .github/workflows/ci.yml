@@ -57,10 +57,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: haskell-actions/run-ormolu@v19
         with:
-          # Pinned to the version the repo is formatted with: formatting is
-          # not stable across ormolu releases, and a floating version would
-          # fail CI on untouched code when upstream ships one. Upgrades bump
-          # this and the local binary together.
+          # Formatting is not stable across ormolu releases; keep this
+          # pinned in lockstep with the local binary.
           version: "0.8.0.2"
           pattern: |
             src/**/*.hs
@@ -119,9 +117,9 @@ jobs:
       - name: Haddock
         run: cabal haddock -f wai -f servant
 
-      # Both flags plus --enable-tests, so Firebase.Auth.WAI, Firebase.Servant
-      # and the test suite meet the same -Werror bar as the core library. The
-      # flags default to off, so a plain `cabal build` never compiles them.
+      # Both flags plus --enable-tests: the flags default to off, so a
+      # plain `cabal build` never compiles Firebase.Auth.WAI or
+      # Firebase.Servant.
       - name: Build
         run: cabal build all -f wai -f servant --enable-tests --ghc-options="-Werror"
 
@@ -129,15 +127,10 @@ jobs:
         run: cabal test -f wai -f servant --ghc-options="-Werror"
 
   # ---------------------------------------------------------------------------
-  # GHC compatibility (Linux-only).
-  #
-  # Boot libraries ship with the compiler, so a bound on containers, time, or
-  # base can only be exercised by the GHC that carries that version. This job
-  # is what makes the declared range honest: containers < 0.8 once excluded
-  # every GHC from 9.10 on, and no amount of testing on 9.8 would show it.
-  #
-  # 9.8 is absent deliberately: the build matrix above already covers it on
-  # Linux with both flags enabled, which is a superset of this job.
+  # GHC compatibility (Linux-only). Boot-library bounds are only exercised
+  # by the GHC that ships each version, so every compiler in tested-with
+  # must build here. 9.8 is covered by the build matrix above, which runs a
+  # superset of this job.
   # ---------------------------------------------------------------------------
 
   ghc-compat:
@@ -171,10 +164,9 @@ jobs:
         run: cabal test
 
   # ---------------------------------------------------------------------------
-  # Build from the sdist, exactly as a Hackage user does (Linux-only).
-  # CI otherwise builds the git tree; the tarball is what users install, and
-  # any divergence (files missing from the sdist, dev-only project settings)
-  # is invisible without this job.
+  # Build from the sdist tarball, exactly as a Hackage user does
+  # (Linux-only). Catches divergence between the git tree and the tarball,
+  # such as files missing from the sdist.
   # ---------------------------------------------------------------------------
 
   sdist:

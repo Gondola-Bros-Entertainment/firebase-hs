@@ -393,8 +393,7 @@ decodeDocumentList body = decodeBody body >>= documentsField
 -- only some carry a document (the final entry may be @readTime@-only).
 --
 -- A result object whose document fails to decode is an error, not a
--- skipped entry: silently dropping it would misreport what the query
--- matched.
+-- skipped entry.
 decodeQueryResults :: LBS.ByteString -> Either FirestoreError [Document]
 decodeQueryResults body =
   decodeBody body >>= fmap catMaybes . traverse resultDocument

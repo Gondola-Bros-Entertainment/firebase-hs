@@ -90,9 +90,8 @@
   cancellation in particular, propagates instead of surfacing as a
   `KeyFetchError` or `NetworkError` result.
 - Widened bounds: `http-client-tls < 0.5` (resolves the Stackage report in
-  issue #1), `containers < 0.9` (`< 0.8` excluded the version GHC 9.10 and
-  later ship, blocking those compilers outright), `aeson < 2.4`,
-  `time < 1.17`, `crypton < 2`. Lowered `base` to `>= 4.18`.
+  issue #1), `containers < 0.9`, `aeson < 2.4`, `time < 1.17`,
+  `crypton < 2`. Lowered `base` to `>= 4.18`, admitting GHC 9.6.
 - CI builds the `wai` and `servant` modules, which no job previously
   compiled, and adds a GHC compatibility matrix, an sdist build, and an
   ASCII-only source check.
