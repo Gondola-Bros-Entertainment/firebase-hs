@@ -269,53 +269,8 @@ injects a `FirebaseUser` into your endpoint, or returns 401.
 
 ## API Reference
 
-### Auth
-
-```haskell
-verifyIdToken       :: Manager -> FirebaseConfig -> ByteString -> IO (Either AuthError FirebaseUser)
-newKeyCache         :: Manager -> IO KeyCache
-newTlsKeyCache      :: IO KeyCache
-verifyIdTokenCached :: KeyCache -> FirebaseConfig -> ByteString -> IO (Either AuthError FirebaseUser)
-authErrorMessage    :: AuthError -> LBS.ByteString
-parseCacheMaxAge    :: ResponseHeaders -> Maybe Int
-```
-
-### Firestore
-
-```haskell
-getDocument    :: Manager -> AccessToken -> ProjectId -> DocumentPath -> IO (Either FirestoreError Document)
-createDocument :: Manager -> AccessToken -> ProjectId -> CollectionPath -> DocumentId -> Map Text FirestoreValue -> IO (Either FirestoreError Document)
-updateDocument :: Manager -> AccessToken -> ProjectId -> DocumentPath -> [Text] -> Map Text FirestoreValue -> IO (Either FirestoreError Document)
-deleteDocument :: Manager -> AccessToken -> ProjectId -> DocumentPath -> IO (Either FirestoreError ())
-runQuery       :: Manager -> AccessToken -> ProjectId -> StructuredQuery -> IO (Either FirestoreError [Document])
-```
-
-### Transactions
-
-```haskell
-beginTransaction    :: Manager -> AccessToken -> ProjectId -> TransactionMode -> IO (Either FirestoreError TransactionId)
-commitTransaction   :: Manager -> AccessToken -> ProjectId -> TransactionId -> [Value] -> IO (Either FirestoreError ())
-rollbackTransaction :: Manager -> AccessToken -> ProjectId -> TransactionId -> IO (Either FirestoreError ())
-runTransaction      :: Manager -> AccessToken -> ProjectId -> TransactionMode -> (TransactionId -> IO (Either FirestoreError [Value])) -> IO (Either FirestoreError ())
-mkUpdateWrite       :: ProjectId -> DocumentPath -> Map Text FirestoreValue -> Value
-mkDeleteWrite       :: ProjectId -> DocumentPath -> Value
-```
-
-### WAI Middleware
-
-```haskell
-requireAuth        :: KeyCache -> FirebaseConfig -> Middleware
-firebaseAuth       :: KeyCache -> FirebaseConfig -> Middleware
-lookupFirebaseUser :: Request -> Maybe FirebaseUser
-```
-
-### Servant
-
-```haskell
-firebaseAuthHandler :: KeyCache -> FirebaseConfig -> AuthHandler Request FirebaseUser
-```
-
-Full Haddock documentation is available on [Hackage](https://hackage.haskell.org/package/firebase-hs).
+Generated from the source and published with each release:
+[hackage.haskell.org/package/firebase-hs](https://hackage.haskell.org/package/firebase-hs)
 
 ---
 
