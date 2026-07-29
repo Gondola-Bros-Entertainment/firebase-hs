@@ -33,8 +33,8 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Vault.Lazy as Vault
 import Firebase.Auth (FirebaseConfig, FirebaseUser, KeyCache, authErrorMessage, verifyIdTokenCached)
-import Firebase.Auth.Internal (bearerToken)
-import Network.HTTP.Types.Header (hContentType)
+import Firebase.Auth.Internal (bearerChallenge, bearerToken)
+import Network.HTTP.Types.Header (hContentType, hWWWAuthenticate)
 import Network.HTTP.Types.Status (status401)
 import Network.Wai
   ( Middleware,
@@ -135,6 +135,10 @@ withVerifiedUser cache cfg req respond onVerified =
       result <- verifyIdTokenCached cache cfg token
       either (respond . unauthorized . authErrorMessage) onVerified result
 
--- | A 401 response carrying a plain-text explanation.
+-- | A 401 response carrying a plain-text explanation and the
+-- @WWW-Authenticate@ challenge RFC 6750 requires.
 unauthorized :: LBS.ByteString -> Response
-unauthorized = responseLBS status401 [(hContentType, textPlain)]
+unauthorized =
+  responseLBS
+    status401
+    [(hContentType, textPlain), (hWWWAuthenticate, bearerChallenge)]

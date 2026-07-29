@@ -1,10 +1,11 @@
 -- |
 -- Module      : Firebase.Firestore.Internal
--- Description : Pure URL builders and request helpers for Firestore
+-- Description : Pure URL builders, request helpers, and response decoders
 -- License     : BSD-3-Clause
 --
--- Internal utilities for constructing Firestore REST API URLs and requests.
--- All functions are pure and testable without IO.
+-- Internal utilities for constructing Firestore REST API URLs and requests
+-- and for decoding its responses. All functions are pure and testable
+-- without IO.
 --
 -- Every caller-supplied component is percent-encoded on the way into a URL,
 -- so a document ID or field path containing @?@, @#@, @%@, a space, or any
@@ -14,13 +15,17 @@ module Firebase.Firestore.Internal
   ( -- * Constants
     firestoreBaseUrl,
 
+    -- * Collection Paths
+    splitCollectionPath,
+
     -- * URL Construction
     databaseUrl,
     documentUrl,
+    documentInTransactionUrl,
     collectionUrl,
     createDocUrl,
     updateDocUrl,
-    queryUrl,
+    runQueryUrl,
     beginTransactionUrl,
     commitUrl,
     rollbackUrl,
@@ -35,19 +40,25 @@ module Firebase.Firestore.Internal
     -- * Request Helpers
     authorizeRequest,
 
-    -- * Response Parsing
+    -- * Response Decoding
     parseFirestoreError,
+    decodeBody,
+    decodeDocumentList,
+    decodeQueryResults,
+    decodeTransactionId,
   )
 where
 
 import Data.Aeson ((.:), (.:?))
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (parseMaybe)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import Data.List (intercalate)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -131,17 +142,44 @@ encodePathSegment = BS8.unpack . urlEncode False . TE.encodeUtf8
 encodeQueryValue :: Text -> String
 encodeQueryValue = BS8.unpack . urlEncode True . TE.encodeUtf8
 
--- | Percent-encode a collection path.
---
--- Subcollections are addressed as @users\/abc\/posts@, so the @\/@
--- separators are structural and survive; each segment between them is
--- encoded.
-encodeCollectionPath :: CollectionPath -> String
-encodeCollectionPath =
+-- | Percent-encode a @\/@-separated path. The separators are structural
+-- and survive; each segment between them is encoded.
+encodeSlashPath :: Text -> String
+encodeSlashPath =
   intercalate pathSeparator
     . map encodePathSegment
     . T.splitOn (T.pack pathSeparator)
-    . unCollectionPath
+
+-- | Percent-encode a collection path.
+--
+-- Subcollections are addressed as @users\/abc\/posts@, so the @\/@
+-- separators survive; each segment between them is encoded.
+encodeCollectionPath :: CollectionPath -> String
+encodeCollectionPath = encodeSlashPath . unCollectionPath
+
+-- ---------------------------------------------------------------------------
+-- Collection paths
+-- ---------------------------------------------------------------------------
+
+-- | Split a collection path into its parent document path, if any, and its
+-- collection ID: the final @\/@-separated segment.
+--
+-- A structured query names these separately: the parent addresses the
+-- @:runQuery@ URL and the collection ID travels in the query body.
+--
+-- >>> splitCollectionPath (CollectionPath "users")
+-- (Nothing,"users")
+--
+-- >>> splitCollectionPath (CollectionPath "users/abc/posts")
+-- (Just "users/abc","posts")
+splitCollectionPath :: CollectionPath -> (Maybe Text, Text)
+splitCollectionPath (CollectionPath path) =
+  case T.breakOnEnd separator path of
+    (parentAndSlash, collectionId)
+      | T.null parentAndSlash -> (Nothing, collectionId)
+      | otherwise -> (Just (T.dropEnd (T.length separator) parentAndSlash), collectionId)
+  where
+    separator = T.pack pathSeparator
 
 -- ---------------------------------------------------------------------------
 -- URL Construction
@@ -177,6 +215,18 @@ documentUrl pid dp =
     <> pathSeparator
     <> encodePathSegment (unDocumentId (dpDocument dp))
 
+-- | URL for fetching a document inside a transaction, pinning the read to
+-- the transaction's snapshot.
+--
+-- Transaction IDs are base64, so the value is percent-encoded on its way
+-- into the query string.
+documentInTransactionUrl :: ProjectId -> TransactionId -> DocumentPath -> String
+documentInTransactionUrl pid txn dp =
+  documentUrl pid dp
+    <> querySeparator
+    <> transactionParam
+    <> encodeQueryValue (unTransactionId txn)
+
 -- | URL for creating a document with a specific ID.
 --
 -- The document ID is passed as a query parameter.
@@ -194,9 +244,21 @@ updateDocUrl :: ProjectId -> DocumentPath -> [Text] -> String
 updateDocUrl pid dp fields =
   documentUrl pid dp <> fieldMaskParams fields
 
--- | URL for running a structured query.
-queryUrl :: ProjectId -> String
-queryUrl = databaseEndpoint runQueryEndpoint
+-- | URL for running a structured query: the @:runQuery@ verb on the
+-- queried collection's parent, which is the database root for a top-level
+-- collection and the enclosing document for a subcollection.
+--
+-- The collection's own ID travels in the query body, not the URL; see
+-- 'Firebase.Firestore.Query.encodeQuery'.
+runQueryUrl :: ProjectId -> CollectionPath -> String
+runQueryUrl pid cp =
+  case splitCollectionPath cp of
+    (Nothing, _) -> databaseEndpoint runQueryEndpoint pid
+    (Just parent, _) ->
+      databaseUrl pid
+        <> pathSeparator
+        <> encodeSlashPath parent
+        <> runQueryEndpoint
 
 -- | URL for beginning a transaction.
 beginTransactionUrl :: ProjectId -> String
@@ -251,6 +313,10 @@ documentIdParam = "documentId="
 -- | Query parameter naming one field an update should touch.
 fieldMaskParam :: String
 fieldMaskParam = "updateMask.fieldPaths="
+
+-- | Query parameter pinning a read to a transaction's snapshot.
+transactionParam :: String
+transactionParam = "transaction="
 
 -- | Build the @updateMask.fieldPaths@ query parameters.
 --
@@ -310,3 +376,46 @@ classifyError code grpcStatus msg =
 -- | An absent optional error field reads as the empty string.
 orEmpty :: Maybe Text -> Text
 orEmpty = fromMaybe ""
+
+-- | Decode a response body, reporting parse failures as 'InvalidResponse'.
+decodeBody :: (Aeson.FromJSON a) => LBS.ByteString -> Either FirestoreError a
+decodeBody = first (InvalidResponse . T.pack) . Aeson.eitherDecode
+
+-- | Decode a @:list@ response. An empty collection omits @documents@.
+decodeDocumentList :: LBS.ByteString -> Either FirestoreError [Document]
+decodeDocumentList body = decodeBody body >>= documentsField
+  where
+    documentsField (Aeson.Object o) =
+      maybe (Right []) (fromAesonResult . Aeson.fromJSON) (KM.lookup "documents" o)
+    documentsField _ = Left (InvalidResponse "expected a JSON object")
+
+-- | Decode a @:runQuery@ response: a stream of result objects, of which
+-- only some carry a document (the final entry may be @readTime@-only).
+--
+-- A result object whose document fails to decode is an error, not a
+-- skipped entry: silently dropping it would misreport what the query
+-- matched.
+decodeQueryResults :: LBS.ByteString -> Either FirestoreError [Document]
+decodeQueryResults body =
+  decodeBody body >>= fmap catMaybes . traverse resultDocument
+  where
+    resultDocument (Aeson.Object o) =
+      traverse (fromAesonResult . Aeson.fromJSON) (KM.lookup "document" o)
+    resultDocument _ = Left (InvalidResponse "expected a query result object")
+
+-- | Decode a @:beginTransaction@ response to extract the transaction ID.
+decodeTransactionId :: LBS.ByteString -> Either FirestoreError TransactionId
+decodeTransactionId body =
+  decodeBody body >>= maybe (Left missingTransaction) Right . transactionField
+  where
+    missingTransaction = InvalidResponse "missing transaction field"
+
+    transactionField (Aeson.Object o) = case KM.lookup "transaction" o of
+      Just (Aeson.String txnId) -> Just (TransactionId txnId)
+      _ -> Nothing
+    transactionField _ = Nothing
+
+-- | Read an aeson conversion, reporting failure as 'InvalidResponse'.
+fromAesonResult :: Aeson.Result a -> Either FirestoreError a
+fromAesonResult (Aeson.Success value) = Right value
+fromAesonResult (Aeson.Error err) = Left (InvalidResponse (T.pack err))

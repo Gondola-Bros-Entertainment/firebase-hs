@@ -31,6 +31,9 @@ module Firebase.Firestore.Types
     TransactionId (..),
     TransactionMode (..),
     encodeTransactionOptions,
+
+    -- * Transaction Writes
+    Write (..),
   )
 where
 
@@ -139,6 +142,18 @@ encodeTransactionOptions ReadOnly =
   Aeson.object
     ["options" .= Aeson.object ["readOnly" .= Aeson.object []]]
 
+-- | A single write in a transaction commit, already in Firestore's wire
+-- form.
+--
+-- Build one with 'Firebase.Firestore.mkUpdateWrite' or
+-- 'Firebase.Firestore.mkDeleteWrite'. The constructor is visible so the
+-- library can assemble writes, and is not part of the supported API.
+newtype Write = Write {unWrite :: Aeson.Value}
+  deriving (Eq, Show)
+
+instance ToJSON Write where
+  toJSON = unWrite
+
 -- ---------------------------------------------------------------------------
 -- Firestore values
 -- ---------------------------------------------------------------------------
@@ -188,11 +203,41 @@ data FirestoreValue
 timestampFormat :: String
 timestampFormat = "%Y-%m-%dT%H:%M:%S%QZ"
 
+-- | The proto3 JSON spellings of the doubles a JSON number cannot carry.
+nanLiteral, positiveInfinityLiteral, negativeInfinityLiteral :: Text
+nanLiteral = "NaN"
+positiveInfinityLiteral = "Infinity"
+negativeInfinityLiteral = "-Infinity"
+
+-- | The IEEE 754 values behind those spellings.
+notANumber, positiveInfinity :: Double
+notANumber = 0 / 0
+positiveInfinity = 1 / 0
+
+-- | Encode a double the way proto3 JSON does: non-finite values travel as
+-- strings, everything else as a plain JSON number.
+encodeDouble :: Double -> Aeson.Value
+encodeDouble d
+  | isNaN d = Aeson.String nanLiteral
+  | isInfinite d, d > 0 = Aeson.String positiveInfinityLiteral
+  | isInfinite d = Aeson.String negativeInfinityLiteral
+  | otherwise = Aeson.toJSON d
+
+-- | Parse a double, accepting the proto3 string spellings of the
+-- non-finite values alongside plain JSON numbers.
+parseDoubleValue :: Aeson.Value -> Parser Double
+parseDoubleValue (Aeson.String t)
+  | t == nanLiteral = pure notANumber
+  | t == positiveInfinityLiteral = pure positiveInfinity
+  | t == negativeInfinityLiteral = pure (negate positiveInfinity)
+  | otherwise = fail ("invalid doubleValue: " ++ T.unpack t)
+parseDoubleValue v = parseJSON v
+
 instance ToJSON FirestoreValue where
   toJSON NullValue = Aeson.object ["nullValue" .= Aeson.Null]
   toJSON (BoolValue b) = Aeson.object ["booleanValue" .= b]
   toJSON (IntegerValue n) = Aeson.object ["integerValue" .= show n]
-  toJSON (DoubleValue d) = Aeson.object ["doubleValue" .= d]
+  toJSON (DoubleValue d) = Aeson.object ["doubleValue" .= encodeDouble d]
   toJSON (StringValue s) = Aeson.object ["stringValue" .= s]
   toJSON (BytesValue bs) = Aeson.object ["bytesValue" .= TE.decodeUtf8 (B64.encode bs)]
   toJSON (ReferenceValue name) = Aeson.object ["referenceValue" .= name]
@@ -212,7 +257,7 @@ instance FromJSON FirestoreValue where
       [("nullValue", _)] -> pure NullValue
       [("booleanValue", v)] -> BoolValue <$> parseJSON v
       [("integerValue", v)] -> IntegerValue <$> parseIntegerValue v
-      [("doubleValue", v)] -> DoubleValue <$> parseJSON v
+      [("doubleValue", v)] -> DoubleValue <$> parseDoubleValue v
       [("stringValue", v)] -> StringValue <$> parseJSON v
       [("bytesValue", v)] -> BytesValue <$> parseBytesValue v
       [("referenceValue", v)] -> ReferenceValue <$> parseJSON v

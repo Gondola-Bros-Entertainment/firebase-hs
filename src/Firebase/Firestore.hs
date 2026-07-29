@@ -43,6 +43,10 @@ module Firebase.Firestore
     rollbackTransaction,
     runTransaction,
 
+    -- * Transactional Reads
+    getDocumentInTransaction,
+    runQueryInTransaction,
+
     -- * Transaction Writes
     mkUpdateWrite,
     mkDeleteWrite,
@@ -56,24 +60,23 @@ module Firebase.Firestore
   )
 where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (try)
 import Control.Monad.Trans.Except (ExceptT (..), runExceptT)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
-import qualified Data.Aeson.KeyMap as KM
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import Data.Functor (void)
 import Data.Map.Strict (Map)
-import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Firebase.Firestore.Internal
 import Firebase.Firestore.Query
 import Firebase.Firestore.Types
 import Network.HTTP.Client
-  ( Request,
+  ( HttpException,
+    Request,
     RequestBody (..),
     Response,
     httpLbs,
@@ -179,9 +182,13 @@ listDocuments fs cp =
 -- ---------------------------------------------------------------------------
 
 -- | Run a structured query against the Firestore REST API.
+--
+-- The request is posted to the queried collection's parent resource, so
+-- subcollection paths (@\"users\/abc\/posts\"@) address the subcollection
+-- under that document.
 runQuery :: Firestore -> StructuredQuery -> IO (Either FirestoreError [Document])
 runQuery fs sq =
-  fmap (>>= decodeQueryResults) (doPost fs (queryUrl (fsProject fs)) body)
+  fmap (>>= decodeQueryResults) (doPost fs (runQueryUrl (fsProject fs) (sqFrom sq)) body)
   where
     body = Aeson.encode (encodeQuery sq)
 
@@ -198,7 +205,7 @@ beginTransaction fs mode =
 
 -- | Commit a transaction with a list of write operations.
 commitTransaction ::
-  Firestore -> TransactionId -> [Aeson.Value] -> IO (Either FirestoreError ())
+  Firestore -> TransactionId -> [Write] -> IO (Either FirestoreError ())
 commitTransaction fs (TransactionId txnId) writes =
   fmap void (doPost fs (commitUrl (fsProject fs)) body)
   where
@@ -214,19 +221,25 @@ rollbackTransaction fs (TransactionId txnId) =
 -- | Run an atomic transaction. The callback receives the transaction ID
 -- and should return a list of writes to commit.
 --
--- On success, all writes are applied atomically. On failure (including
--- callback errors), the transaction is rolled back automatically.
--- Use 'RetryWith' to retry an aborted transaction.
+-- Reads made with 'getDocumentInTransaction' or 'runQueryInTransaction'
+-- inside the callback see the transaction's snapshot, and Firestore
+-- verifies at commit that nothing they read has changed since; losing that
+-- race is reported as 'TransactionAborted'. Reads made without the
+-- transaction ID are ordinary reads and get no such guarantee.
+--
+-- On success, all writes are applied atomically. On a callback or commit
+-- error, the transaction is rolled back automatically. Use 'RetryWith' to
+-- retry an aborted transaction.
 --
 -- @
--- runTransaction fs ReadWrite $ \\_txnId -> runExceptT $ do
---   doc <- ExceptT $ getDocument fs somePath
+-- runTransaction fs ReadWrite $ \\txnId -> runExceptT $ do
+--   doc <- ExceptT $ getDocumentInTransaction fs txnId somePath
 --   pure [mkUpdateWrite (fsProject fs) somePath (applyDebit 100 (docFields doc))]
 -- @
 runTransaction ::
   Firestore ->
   TransactionMode ->
-  (TransactionId -> IO (Either FirestoreError [Aeson.Value])) ->
+  (TransactionId -> IO (Either FirestoreError [Write])) ->
   IO (Either FirestoreError ())
 runTransaction fs mode action = do
   started <- beginTransaction fs mode
@@ -245,32 +258,52 @@ runTransaction fs mode action = do
       pure (Left err)
 
 -- ---------------------------------------------------------------------------
+-- Transactional Reads
+-- ---------------------------------------------------------------------------
+
+-- | Fetch a document inside a transaction.
+--
+-- The read is served from the transaction's snapshot and joins its read
+-- set, so a conflicting write elsewhere aborts the commit instead of being
+-- silently overwritten.
+getDocumentInTransaction ::
+  Firestore -> TransactionId -> DocumentPath -> IO (Either FirestoreError Document)
+getDocumentInTransaction fs txn dp =
+  fmap (>>= decodeBody) (doGet fs (documentInTransactionUrl (fsProject fs) txn dp))
+
+-- | Run a structured query inside a transaction, with the same snapshot
+-- and commit-time verification as 'getDocumentInTransaction'.
+runQueryInTransaction ::
+  Firestore -> TransactionId -> StructuredQuery -> IO (Either FirestoreError [Document])
+runQueryInTransaction fs txn sq =
+  fmap (>>= decodeQueryResults) (doPost fs (runQueryUrl (fsProject fs) (sqFrom sq)) body)
+  where
+    body = Aeson.encode (encodeQueryInTransaction txn sq)
+
+-- ---------------------------------------------------------------------------
 -- Transaction Writes
 -- ---------------------------------------------------------------------------
 
--- | A write that sets a document's fields, creating it if absent.
---
--- 'commitTransaction' and the callback to 'runTransaction' take writes in
--- Firestore's wire form; these constructors build that form so callers do
--- not hand-assemble it.
+-- | A t'Write' that sets a document's fields, creating it if absent.
 mkUpdateWrite ::
   ProjectId ->
   DocumentPath ->
   Map Text FirestoreValue ->
-  Aeson.Value
+  Write
 mkUpdateWrite pid dp fields =
-  Aeson.object
-    [ "update"
-        .= Aeson.object
-          [ "name" .= documentResourceName pid dp,
-            "fields" .= fields
-          ]
-    ]
+  Write $
+    Aeson.object
+      [ "update"
+          .= Aeson.object
+            [ "name" .= documentResourceName pid dp,
+              "fields" .= fields
+            ]
+      ]
 
--- | A write that deletes a document.
-mkDeleteWrite :: ProjectId -> DocumentPath -> Aeson.Value
+-- | A t'Write' that deletes a document.
+mkDeleteWrite :: ProjectId -> DocumentPath -> Write
 mkDeleteWrite pid dp =
-  Aeson.object ["delete" .= documentResourceName pid dp]
+  Write (Aeson.object ["delete" .= documentResourceName pid dp])
 
 -- ---------------------------------------------------------------------------
 -- HTTP Helpers
@@ -303,11 +336,14 @@ doRequest fs url httpMethod mBody = runExceptT $ do
   resp <- ExceptT (tryNetwork (httpLbs req (fsManager fs)))
   ExceptT (pure (responseOrError resp))
 
--- | Run an action that may throw, reporting any exception as a network error.
+-- | Run an action, reporting HTTP-layer failures as 'NetworkError'.
+--
+-- Only 'HttpException' is caught: anything else (asynchronous
+-- cancellation, for instance) is not a network result and propagates.
 tryNetwork :: IO a -> IO (Either FirestoreError a)
 tryNetwork action = first describe <$> try action
   where
-    describe :: SomeException -> FirestoreError
+    describe :: HttpException -> FirestoreError
     describe = NetworkError . T.pack . show
 
 -- | Apply the method, headers, and body to a parsed request.
@@ -329,51 +365,3 @@ responseOrError resp
   where
     status = responseStatus resp
     body = responseBody resp
-
--- ---------------------------------------------------------------------------
--- Response Decoders (pure)
--- ---------------------------------------------------------------------------
-
--- | Decode a response body, reporting parse failures as 'InvalidResponse'.
-decodeBody :: (Aeson.FromJSON a) => LBS.ByteString -> Either FirestoreError a
-decodeBody = first (InvalidResponse . T.pack) . Aeson.eitherDecode
-
--- | Decode a @:list@ response. An empty collection omits @documents@.
-decodeDocumentList :: LBS.ByteString -> Either FirestoreError [Document]
-decodeDocumentList body = decodeBody body >>= documentsField
-  where
-    documentsField (Aeson.Object o) =
-      maybe (Right []) fromResult (KM.lookup "documents" o)
-    documentsField _ = Left (InvalidResponse "expected a JSON object")
-
-    fromResult value = case Aeson.fromJSON value of
-      Aeson.Success docs -> Right docs
-      Aeson.Error err -> Left (InvalidResponse (T.pack err))
-
--- | Decode a query response: a stream of result objects, of which only some
--- carry a document.
-decodeQueryResults :: LBS.ByteString -> Either FirestoreError [Document]
-decodeQueryResults = fmap extractDocuments . decodeBody
-
--- | Extract documents from query result objects, skipping entries without
--- a @\"document\"@ field (e.g. the final @\"readTime\"@-only entry).
-extractDocuments :: [Aeson.Value] -> [Document]
-extractDocuments = mapMaybe resultDocument
-  where
-    resultDocument (Aeson.Object o) = KM.lookup "document" o >>= fromResult . Aeson.fromJSON
-    resultDocument _ = Nothing
-
-    fromResult (Aeson.Success doc) = Just doc
-    fromResult (Aeson.Error _) = Nothing
-
--- | Decode a beginTransaction response to extract the transaction ID.
-decodeTransactionId :: LBS.ByteString -> Either FirestoreError TransactionId
-decodeTransactionId body =
-  decodeBody body >>= maybe (Left missingTransaction) Right . transactionField
-  where
-    missingTransaction = InvalidResponse "missing transaction field"
-
-    transactionField (Aeson.Object o) = case KM.lookup "transaction" o of
-      Just (Aeson.String txnId) -> Just (TransactionId txnId)
-      _ -> Nothing
-    transactionField _ = Nothing

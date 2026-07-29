@@ -12,6 +12,17 @@
   `referenceValue`, and `geoPointValue` had no representation, so a document
   containing any of them failed to decode outright and `getDocument` returned
   `InvalidResponse` for data Firestore considers perfectly valid.
+- Non-finite doubles travel in proto3 JSON's string spellings. `DoubleValue`
+  holding NaN or an infinity previously encoded as `null` or `"+inf"`, which
+  Firestore rejects, and a stored `"NaN"`, `"Infinity"`, or `"-Infinity"`
+  failed to decode, making any document that held one unreadable.
+- `runQuery` posts to the queried collection's parent resource, so a
+  subcollection path (`users/abc/posts`) now queries that subcollection.
+  The full path used to be sent as the `from` collection ID, which
+  Firestore rejects; only top-level collections were queryable.
+- A query result whose document fails to decode is reported as
+  `InvalidResponse` instead of being silently dropped, which misreported
+  what the query matched.
 - A cache refresh no longer overwrites a newer key set installed by a
   concurrent verification.
 
@@ -23,6 +34,12 @@
 - `FirebaseUser` gained fields, so positional construction no longer
   compiles. Pattern matches on `fuUid`, `fuEmail`, and `fuName` are
   unaffected.
+- `commitTransaction` and the `runTransaction` callback take the new opaque
+  `Write` type in place of raw `Aeson.Value`, with `mkUpdateWrite` and
+  `mkDeleteWrite` constructing it. Hand-assembled write JSON no longer
+  typechecks.
+- `Firebase.Firestore.Internal.queryUrl` is replaced by `runQueryUrl`, which
+  takes the queried collection so it can address the parent resource.
 - `KeyCache` is now backed by `IORef` rather than `TVar`, and `Firebase.Auth`
   re-exports it as an abstract type. Construct it with `newKeyCache` or
   `newTlsKeyCache`.
@@ -40,11 +57,18 @@
   `FirestoreApiError status "" "unknown error"`.
 
 ### Added
+- `getDocumentInTransaction` and `runQueryInTransaction` read inside a
+  transaction. The reads see the transaction's snapshot and Firestore
+  verifies at commit that nothing they read has changed, which is what makes
+  `runTransaction` a transaction rather than an atomic batch write; reads
+  without the transaction ID never did either.
 - Token claims are no longer discarded. `FirebaseUser` now carries
   `fuEmailVerified`, `fuPicture`, `fuAuthTime`, `fuSignInProvider`, and
   `fuCustomClaims`, with `hasClaim` and `lookupClaim` to read them. Custom
   claims are how Firebase expresses roles, so without them a verified token
   could establish identity but not authorize anything.
+- 401 responses from the WAI middleware and the Servant handler carry the
+  `WWW-Authenticate: Bearer` challenge RFC 6750 requires.
 - `listDocuments` lists a collection. `collectionUrl` had described itself as
   "used for listing" since the first release with nothing to use it.
 - `BytesValue`, `ReferenceValue`, `GeoPointValue`, and the `GeoPoint` type.
@@ -55,11 +79,16 @@
 - `Firebase.Auth.Internal`: base64url padding and bearer-token extraction,
   shared by the verifier and both web integrations.
 - `authErrorMessage` renders an `AuthError` as a client-safe body.
-- `documentResourceName` and the percent-encoding helpers are exported from
-  `Firebase.Firestore.Internal`.
+- `documentResourceName`, the percent-encoding helpers,
+  `splitCollectionPath`, `documentInTransactionUrl`, and the pure response
+  decoders (`decodeBody`, `decodeDocumentList`, `decodeQueryResults`,
+  `decodeTransactionId`) are exported from `Firebase.Firestore.Internal`.
 
 ### Changed
 - Bearer scheme names are matched case-insensitively, as RFC 7235 requires.
+- Network calls catch only `HttpException`. Anything else, asynchronous
+  cancellation in particular, propagates instead of surfacing as a
+  `KeyFetchError` or `NetworkError` result.
 - Widened bounds: `http-client-tls < 0.5` (resolves the Stackage report in
   issue #1), `containers < 0.9` (`< 0.8` excluded the version GHC 9.10 and
   later ship, blocking those compilers outright), `aeson < 2.4`,

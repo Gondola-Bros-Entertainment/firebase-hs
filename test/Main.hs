@@ -84,7 +84,8 @@ tests =
       queryTests,
       transactionOptionTests,
       requestTests,
-      errorParsingTests
+      errorParsingTests,
+      decoderTests
     ]
 
 -- ---------------------------------------------------------------------------
@@ -288,7 +289,21 @@ valueRoundtripTests =
     Test "IntegerValue rejects a hexadecimal literal" $
       (Aeson.decode "{\"integerValue\":\"0x2A\"}" :: Maybe FirestoreValue) `shouldBe` Nothing,
     Test "IntegerValue rejects trailing characters" $
-      (Aeson.decode "{\"integerValue\":\"42abc\"}" :: Maybe FirestoreValue) `shouldBe` Nothing
+      (Aeson.decode "{\"integerValue\":\"42abc\"}" :: Maybe FirestoreValue) `shouldBe` Nothing,
+    Test "DoubleValue roundtrips positive infinity" $
+      roundtrip (DoubleValue (1 / 0)),
+    Test "DoubleValue encodes NaN as the proto3 string" $
+      Aeson.encode (DoubleValue (0 / 0))
+        `shouldBe` Aeson.encode (Aeson.object ["doubleValue" Aeson..= ("NaN" :: Text)]),
+    Test "DoubleValue encodes negative infinity as the proto3 string" $
+      Aeson.encode (DoubleValue (negate (1 / 0)))
+        `shouldBe` Aeson.encode (Aeson.object ["doubleValue" Aeson..= ("-Infinity" :: Text)]),
+    Test "DoubleValue decodes the proto3 NaN string" $
+      case Aeson.decode "{\"doubleValue\":\"NaN\"}" of
+        Just (DoubleValue d) -> shouldHold "NaN decodes to NaN" (isNaN d)
+        other -> Left ("expected a DoubleValue, got " <> show other),
+    Test "DoubleValue rejects an unknown string spelling" $
+      (Aeson.decode "{\"doubleValue\":\"fast\"}" :: Maybe FirestoreValue) `shouldBe` Nothing
   ]
 
 -- | Encode then decode, and confirm nothing was lost.
@@ -369,8 +384,12 @@ urlTests =
         <> "/users/alice?updateMask.fieldPaths=name&updateMask.fieldPaths=age",
     Test "updateDocUrl without fields builds correct URL" $
       updateDocUrl testProject alicePath [] `shouldBe` testDatabaseUrl <> "/users/alice",
-    Test "queryUrl builds correct URL" $
-      queryUrl testProject `shouldBe` testDatabaseUrl <> ":runQuery",
+    Test "runQueryUrl posts to the database root for a top-level collection" $
+      runQueryUrl testProject (CollectionPath "users") `shouldBe` testDatabaseUrl <> ":runQuery",
+    Test "runQueryUrl posts to the parent document for a subcollection" $
+      runQueryUrl testProject (CollectionPath "users/abc/posts")
+        `shouldBe` testDatabaseUrl
+        <> "/users/abc:runQuery",
     Test "beginTransactionUrl builds correct URL" $
       beginTransactionUrl testProject `shouldBe` testDatabaseUrl <> ":beginTransaction",
     Test "commitUrl builds correct URL" $
@@ -380,7 +399,13 @@ urlTests =
     Test "collectionUrl keeps subcollection separators" $
       collectionUrl testProject (CollectionPath "users/abc/posts")
         `shouldBe` testDatabaseUrl
-        <> "/users/abc/posts"
+        <> "/users/abc/posts",
+    Test "splitCollectionPath keeps a top-level collection whole" $
+      splitCollectionPath (CollectionPath "users") `shouldBe` (Nothing, "users"),
+    Test "splitCollectionPath splits a subcollection from its parent" $
+      splitCollectionPath (CollectionPath "users/abc/posts") `shouldBe` (Just "users/abc", "posts"),
+    Test "splitCollectionPath splits a deep subcollection" $
+      splitCollectionPath (CollectionPath "a/b/c/d/e") `shouldBe` (Just "a/b/c/d", "e")
   ]
 
 -- ---------------------------------------------------------------------------
@@ -428,7 +453,15 @@ urlEncodingTests =
     Test "collectionUrl escapes within a subcollection segment" $
       collectionUrl testProject (CollectionPath "users/a b/posts")
         `shouldBe` testDatabaseUrl
-        <> "/users/a%20b/posts"
+        <> "/users/a%20b/posts",
+    Test "runQueryUrl escapes within the parent path" $
+      runQueryUrl testProject (CollectionPath "users/a b/posts")
+        `shouldBe` testDatabaseUrl
+        <> "/users/a%20b:runQuery",
+    Test "documentInTransactionUrl escapes the transaction ID" $
+      documentInTransactionUrl testProject (TransactionId "ab+/=") alicePath
+        `shouldBe` testDatabaseUrl
+        <> "/users/alice?transaction=ab%2B%2F%3D"
   ]
 
 -- ---------------------------------------------------------------------------
@@ -455,7 +488,7 @@ resourceNameTests =
 writeTests :: [Test]
 writeTests =
   [ Test "mkUpdateWrite encodes name and fields" $
-      mkUpdateWrite testProject alicePath (Map.fromList [("age", IntegerValue 31)])
+      Aeson.toJSON (mkUpdateWrite testProject alicePath (Map.fromList [("age", IntegerValue 31)]))
         `shouldBe` Aeson.object
           [ "update"
               Aeson..= Aeson.object
@@ -466,11 +499,11 @@ writeTests =
                 ]
           ],
     Test "mkDeleteWrite encodes the document name" $
-      mkDeleteWrite testProject alicePath
+      Aeson.toJSON (mkDeleteWrite testProject alicePath)
         `shouldBe` Aeson.object
           ["delete" Aeson..= (T.pack (testResourcePrefix <> "/users/alice") :: Text)],
     Test "mkUpdateWrite accepts an empty field map" $
-      mkUpdateWrite testProject alicePath Map.empty
+      Aeson.toJSON (mkUpdateWrite testProject alicePath Map.empty)
         `shouldBe` Aeson.object
           [ "update"
               Aeson..= Aeson.object
@@ -522,6 +555,15 @@ queryTests :: [Test]
 queryTests =
   [ Test "query encodes basic collection" $
       encodeQuery (query (CollectionPath "users")) `shouldBe` structuredQuery [fromCollection "users"],
+    Test "query on a subcollection names only its collection ID" $
+      encodeQuery (query (CollectionPath "users/abc/posts"))
+        `shouldBe` structuredQuery [fromCollection "posts"],
+    Test "encodeQueryInTransaction carries the transaction alongside the query" $
+      encodeQueryInTransaction (TransactionId "txn123") (query (CollectionPath "users"))
+        `shouldBe` Aeson.object
+          [ "structuredQuery" Aeson..= Aeson.object [fromCollection "users"],
+            "transaction" Aeson..= ("txn123" :: Text)
+          ],
     Test "query encodes with field filter" $
       encodeQuery (query (CollectionPath "users") & where_ (fieldFilter "age" OpGreaterThan (IntegerValue 18)))
         `shouldBe` structuredQuery
@@ -686,6 +728,49 @@ errorParsingTests =
       parseFirestoreError 403 "{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\"}}"
         `shouldBe` PermissionDenied ""
   ]
+
+-- ---------------------------------------------------------------------------
+-- Firestore: Response decoding
+-- ---------------------------------------------------------------------------
+
+decoderTests :: [Test]
+decoderTests =
+  [ Test "decodeQueryResults keeps documents and skips the readTime entry" $
+      decodeQueryResults
+        "[{\"document\":{\"name\":\"projects/p/databases/(default)/documents/c/d\"}}\
+        \,{\"readTime\":\"2024-01-15T10:30:00Z\"}]"
+        `shouldBe` Right
+          [ Document
+              { docName = "projects/p/databases/(default)/documents/c/d",
+                docFields = Map.empty,
+                docCreateTime = Nothing,
+                docUpdateTime = Nothing
+              }
+          ],
+    Test "decodeQueryResults reports a malformed document instead of dropping it" $
+      shouldHold "InvalidResponse" $
+        isInvalidResponse (decodeQueryResults "[{\"document\":{\"fields\":{}}}]"),
+    Test "decodeQueryResults reports a non-object result entry" $
+      shouldHold "InvalidResponse" (isInvalidResponse (decodeQueryResults "[42]")),
+    Test "decodeDocumentList reads an empty response as no documents" $
+      decodeDocumentList "{}" `shouldBe` Right [],
+    Test "decodeDocumentList reads the documents field" $
+      fmap
+        (map docName)
+        ( decodeDocumentList
+            "{\"documents\":[{\"name\":\"projects/p/databases/(default)/documents/c/d\"}]}"
+        )
+        `shouldBe` Right ["projects/p/databases/(default)/documents/c/d"],
+    Test "decodeTransactionId extracts the ID" $
+      decodeTransactionId "{\"transaction\":\"txn-bytes\"}"
+        `shouldBe` Right (TransactionId "txn-bytes"),
+    Test "decodeTransactionId reports a missing ID" $
+      shouldHold "InvalidResponse" (isInvalidResponse (decodeTransactionId "{}"))
+  ]
+  where
+    isInvalidResponse :: Either FirestoreError a -> Bool
+    isInvalidResponse (Left (InvalidResponse _)) = True
+    isInvalidResponse _ = False
 
 -- ---------------------------------------------------------------------------
 -- Helpers

@@ -34,9 +34,10 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (throwE)
 import qualified Data.ByteString.Lazy as LBS
 import Firebase.Auth (FirebaseConfig, FirebaseUser, KeyCache, authErrorMessage, verifyIdTokenCached)
-import Firebase.Auth.Internal (bearerToken)
+import Firebase.Auth.Internal (bearerChallenge, bearerToken)
+import Network.HTTP.Types.Header (hWWWAuthenticate)
 import Network.Wai (Request, requestHeaders)
-import Servant.Server (Handler (..), err401, errBody)
+import Servant.Server (Handler (..), err401, errBody, errHeaders)
 import Servant.Server.Experimental.Auth (AuthHandler, mkAuthHandler)
 
 -- ---------------------------------------------------------------------------
@@ -68,9 +69,12 @@ firebaseAuthHandler cache cfg = mkAuthHandler $ \req ->
       result <- liftIO (verifyIdTokenCached cache cfg token)
       either (throw401 . authErrorMessage) pure result
 
--- | Throw a 401 error in the Servant t'Handler' monad.
+-- | Throw a 401 error, with the @WWW-Authenticate@ challenge RFC 6750
+-- requires, in the Servant t'Handler' monad.
 --
 -- Built on the t'Handler' newtype rather than @MonadError@, which keeps this
 -- working across servant versions without depending on @mtl@.
 throw401 :: LBS.ByteString -> Handler a
-throw401 msg = Handler (throwE err401 {errBody = msg})
+throw401 msg =
+  Handler
+    (throwE err401 {errBody = msg, errHeaders = [(hWWWAuthenticate, bearerChallenge)]})

@@ -46,7 +46,7 @@ module Firebase.Auth
   )
 where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (try)
 import Control.Monad (guard)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.PubKey.RSA.PKCS15 (verify)
@@ -74,7 +74,8 @@ import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Firebase.Auth.Internal (padBase64Url)
 import Firebase.Auth.Types
 import Network.HTTP.Client
-  ( Manager,
+  ( HttpException,
+    Manager,
     Response,
     httpLbs,
     parseRequest,
@@ -289,10 +290,15 @@ laterExpiring cached fetched
 -- Key fetching
 -- ---------------------------------------------------------------------------
 
+-- | Fetch Google's current public keys.
+--
+-- Only 'HttpException' becomes a 'KeyFetchError': anything else
+-- (asynchronous cancellation, for instance) is not a fetch result and
+-- propagates.
 fetchGoogleKeys :: Manager -> IO (Either AuthError (JwkSet, UTCTime))
 fetchGoogleKeys mgr = do
   req <- parseRequest googleJwkUrl
-  fetched <- try (httpLbs req mgr) :: IO (Either SomeException (Response LBS.ByteString))
+  fetched <- try (httpLbs req mgr) :: IO (Either HttpException (Response LBS.ByteString))
   case fetched of
     Left err -> pure (Left (KeyFetchError (T.pack (show err))))
     Right resp -> do

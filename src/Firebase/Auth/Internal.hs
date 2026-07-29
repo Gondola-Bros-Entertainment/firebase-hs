@@ -14,6 +14,7 @@ module Firebase.Auth.Internal
     -- * Bearer tokens
     bearerToken,
     stripBearerPrefix,
+    bearerChallenge,
   )
 where
 
@@ -59,6 +60,11 @@ bearerPrefix = "Bearer "
 -- | 'bearerPrefix' folded to lower case once, for case-insensitive matching.
 bearerPrefixLower :: BS.ByteString
 bearerPrefixLower = BS8.map toLower bearerPrefix
+
+-- | The challenge a 401 response carries in its @WWW-Authenticate@ header,
+-- naming the scheme the request should have used, as RFC 6750 requires.
+bearerChallenge :: BS.ByteString
+bearerChallenge = "Bearer"
 
 -- | Extract a bearer token from a request's headers.
 --

@@ -16,7 +16,7 @@
 -- @
 module Firebase.Firestore.Query
   ( -- * Query Construction
-    StructuredQuery,
+    StructuredQuery (sqFrom),
     query,
     where_,
     orderBy,
@@ -38,13 +38,15 @@ module Firebase.Firestore.Query
 
     -- * Encoding
     encodeQuery,
+    encodeQueryInTransaction,
   )
 where
 
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import Data.Text (Text)
-import Firebase.Firestore.Types (CollectionPath (..), FirestoreValue)
+import Firebase.Firestore.Internal (splitCollectionPath)
+import Firebase.Firestore.Types (CollectionPath (..), FirestoreValue, TransactionId (..))
 
 -- ---------------------------------------------------------------------------
 -- Types
@@ -53,7 +55,9 @@ import Firebase.Firestore.Types (CollectionPath (..), FirestoreValue)
 -- | A structured query builder. Construct with 'query' and refine with
 -- 'where_', 'orderBy', 'limit', and 'offset'.
 data StructuredQuery = StructuredQuery
-  { sqFrom :: !CollectionPath,
+  { -- | The collection the query reads. 'Firebase.Firestore.runQuery'
+    -- addresses its parent resource and the query body names its ID.
+    sqFrom :: !CollectionPath,
     sqWhere :: !(Maybe Filter),
     sqOrderBy :: ![(Text, OrderDirection)],
     sqLimit :: !(Maybe Int),
@@ -154,9 +158,21 @@ compositeOr = CompositeFilterF . CompositeFilter OpOr
 -- | Encode a t'StructuredQuery' to the JSON format expected by the
 -- Firestore REST API's @:runQuery@ endpoint.
 encodeQuery :: StructuredQuery -> Aeson.Value
-encodeQuery sq =
+encodeQuery = queryRequest []
+
+-- | Encode a query that runs inside a transaction: the request carries the
+-- transaction ID, so the read joins the transaction's snapshot and is
+-- validated at commit.
+encodeQueryInTransaction :: TransactionId -> StructuredQuery -> Aeson.Value
+encodeQueryInTransaction (TransactionId txn) =
+  queryRequest ["transaction" .= txn]
+
+-- | The @:runQuery@ request envelope, with any transaction pinning
+-- alongside the structured query itself.
+queryRequest :: [(Aeson.Key, Aeson.Value)] -> StructuredQuery -> Aeson.Value
+queryRequest extras sq =
   Aeson.object
-    [ "structuredQuery"
+    ( "structuredQuery"
         .= Aeson.object
           ( ["from" .= [encodeCollectionSelector (sqFrom sq)]]
               ++ maybe [] (\f -> ["where" .= encodeFilter f]) (sqWhere sq)
@@ -164,12 +180,15 @@ encodeQuery sq =
               ++ maybe [] (\n -> ["limit" .= n]) (sqLimit sq)
               ++ maybe [] (\n -> ["offset" .= n]) (sqOffset sq)
           )
-    ]
+        : extras
+    )
 
--- | Encode a collection selector.
+-- | Encode a collection selector: only the collection's own ID. The parent
+-- segments of a subcollection path are addressed by the URL instead; see
+-- 'Firebase.Firestore.Internal.runQueryUrl'.
 encodeCollectionSelector :: CollectionPath -> Aeson.Value
-encodeCollectionSelector (CollectionPath cp) =
-  Aeson.object ["collectionId" .= cp]
+encodeCollectionSelector cp =
+  Aeson.object ["collectionId" .= snd (splitCollectionPath cp)]
 
 -- | Encode a filter to Firestore JSON.
 encodeFilter :: Filter -> Aeson.Value
