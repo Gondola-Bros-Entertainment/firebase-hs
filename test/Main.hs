@@ -315,7 +315,11 @@ valueRoundtripTests =
       (Aeson.decode "{\"integerValue\":\"9223372036854775808\"}" :: Maybe FirestoreValue)
         `shouldBe` Nothing
         >> (Aeson.decode "{\"integerValue\":\"-9223372036854775809\"}" :: Maybe FirestoreValue)
-          `shouldBe` Nothing
+          `shouldBe` Nothing,
+    Test "TimestampValue caps encoded precision at nine fractional digits" $
+      Aeson.encode (TimestampValue (parseUTCSubsecond "2024-01-15T10:30:00.123456789012Z"))
+        `shouldBe` Aeson.encode
+          (Aeson.object ["timestampValue" Aeson..= ("2024-01-15T10:30:00.123456789Z" :: Text)])
   ]
 
 -- | Encode then decode, and confirm nothing was lost.
@@ -738,7 +742,13 @@ errorParsingTests =
         `shouldBe` FirestoreApiError 500 "INTERNAL" "boom",
     Test "parseFirestoreError tolerates a missing message" $
       parseFirestoreError 403 "{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\"}}"
-        `shouldBe` PermissionDenied ""
+        `shouldBe` PermissionDenied "",
+    Test "parseFirestoreError unwraps a streaming array-framed error" $
+      parseFirestoreError 403 "[{\"error\":{\"code\":403,\"message\":\"denied\",\"status\":\"PERMISSION_DENIED\"}}]"
+        `shouldBe` PermissionDenied "denied",
+    Test "parseFirestoreError classifies an array-framed ABORTED" $
+      parseFirestoreError 409 "[{\"error\":{\"code\":409,\"message\":\"contention\",\"status\":\"ABORTED\"}}]"
+        `shouldBe` TransactionAborted "contention"
   ]
 
 -- ---------------------------------------------------------------------------
@@ -777,7 +787,15 @@ decoderTests =
       decodeTransactionId "{\"transaction\":\"txn-bytes\"}"
         `shouldBe` Right (TransactionId "txn-bytes"),
     Test "decodeTransactionId reports a missing ID" $
-      shouldHold "InvalidResponse" (isInvalidResponse (decodeTransactionId "{}"))
+      shouldHold "InvalidResponse" (isInvalidResponse (decodeTransactionId "{}")),
+    Test "decodeQueryResults surfaces a streamed error element" $
+      decodeQueryResults "[{\"error\":{\"code\":403,\"message\":\"denied\",\"status\":\"PERMISSION_DENIED\"}}]"
+        `shouldBe` Left (PermissionDenied "denied"),
+    Test "decodeQueryResults reports an error after partial results" $
+      decodeQueryResults
+        "[{\"document\":{\"name\":\"projects/p/databases/(default)/documents/c/d\"}}\
+        \,{\"error\":{\"code\":409,\"message\":\"contention\",\"status\":\"ABORTED\"}}]"
+        `shouldBe` Left (TransactionAborted "contention")
   ]
   where
     isInvalidResponse :: Either FirestoreError a -> Bool
@@ -791,3 +809,7 @@ decoderTests =
 -- | Parse a UTC time string for test data.
 parseUTC :: String -> UTCTime
 parseUTC = parseTimeOrError True defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+
+-- | Parse a UTC time with sub-second precision, for the timestamp-precision test.
+parseUTCSubsecond :: String -> UTCTime
+parseUTCSubsecond = parseTimeOrError True defaultTimeLocale "%Y-%m-%dT%H:%M:%S%QZ"

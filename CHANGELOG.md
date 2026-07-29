@@ -30,6 +30,18 @@
   aeson's `Double` parser, which reads JSON null as NaN.
 - A cache refresh no longer overwrites a newer key set installed by a
   concurrent verification.
+- `runQuery` and `runQueryInTransaction` classify their error responses.
+  Firestore's streaming endpoints frame an error as a single-element JSON
+  array, which the parser did not read, so a query that failed with an
+  error response surfaced as `NetworkError "HTTP <status>"` instead of
+  `DocumentNotFound`, `PermissionDenied`, `TransactionAborted`, or a
+  specific API error.
+- A query stream that fails after emitting some results reports the error
+  instead of returning the partial page as a success. The trailing error
+  entry was dropped, so a truncated result set looked complete.
+- `TimestampValue` encodes at most nanosecond precision. A `UTCTime`
+  carrying sub-nanosecond digits formatted to more than the nine fractional
+  digits Firestore accepts, which it rejects on write.
 
 ### Breaking Changes
 - Firestore operations take a single `Firestore` handle in place of the

@@ -51,7 +51,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Read as TR
-import Data.Time (UTCTime)
+import Data.Time (UTCTime, utctDayTime)
+import Data.Time.Clock (diffTimeToPicoseconds, picosecondsToDiffTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
 import Network.HTTP.Client (Manager)
 
@@ -203,6 +204,20 @@ data FirestoreValue
 timestampFormat :: String
 timestampFormat = "%Y-%m-%dT%H:%M:%S%QZ"
 
+-- | Picoseconds in one nanosecond.
+picosecondsPerNanosecond :: Integer
+picosecondsPerNanosecond = 1000
+
+-- | Drop a 'UTCTime' below nanosecond resolution. Firestore timestamps carry
+-- at most nine fractional digits, but a 'UTCTime' holds picoseconds, so a
+-- value with sub-nanosecond precision would format to more digits than
+-- Firestore accepts and be rejected on write.
+truncateToNanos :: UTCTime -> UTCTime
+truncateToNanos t =
+  t {utctDayTime = picosecondsToDiffTime (nanoseconds * picosecondsPerNanosecond)}
+  where
+    nanoseconds = diffTimeToPicoseconds (utctDayTime t) `div` picosecondsPerNanosecond
+
 -- | The proto3 JSON spellings of the doubles a JSON number cannot carry.
 nanLiteral, positiveInfinityLiteral, negativeInfinityLiteral :: Text
 nanLiteral = "NaN"
@@ -246,7 +261,7 @@ instance ToJSON FirestoreValue where
   toJSON (GeoPointValue gp) = Aeson.object ["geoPointValue" .= gp]
   toJSON (TimestampValue t) =
     Aeson.object
-      ["timestampValue" .= formatTime defaultTimeLocale timestampFormat t]
+      ["timestampValue" .= formatTime defaultTimeLocale timestampFormat (truncateToNanos t)]
   toJSON (ArrayValue xs) =
     Aeson.object ["arrayValue" .= Aeson.object ["values" .= xs]]
   toJSON (MapValue m) =

@@ -56,6 +56,7 @@ import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
+import Data.Foldable (toList)
 import Data.List (intercalate)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
@@ -347,22 +348,36 @@ authorizeRequest (AccessToken tok) req =
 -- { "error": { "code": 404, "message": "...", "status": "NOT_FOUND" } }
 -- @
 --
--- Bodies that do not match fall back to the HTTP status, which is always
--- known.
+-- The streaming query endpoints wrap that object in a single-element JSON
+-- array; both shapes are read. Bodies that match neither fall back to the
+-- HTTP status, which is always known.
 parseFirestoreError :: Int -> LBS.ByteString -> FirestoreError
 parseFirestoreError status body =
-  case Aeson.decode body >>= parseMaybe errorFields of
-    Just (code, grpcStatus, msg) -> classifyError code grpcStatus msg
-    Nothing -> unrecognized
+  fromMaybe unrecognized (Aeson.decode body >>= classifyErrorValue . unwrapStreamFrame)
   where
     -- A body that is not JSON, or not shaped like a Firestore error, tells
     -- us nothing the HTTP status has not already.
     unrecognized = NetworkError ("HTTP " <> T.pack (show status))
 
-    errorFields = Aeson.withObject "response" $ \o ->
-      o .: "error" >>= Aeson.withObject "error" errorTriple
+-- | Firestore's streaming endpoints (@:runQuery@) frame their response as a
+-- JSON array, and frame a failure before the first result as a
+-- single-element array wrapping the ordinary error object. Unwrap that so
+-- the error inside classifies like any other.
+unwrapStreamFrame :: Aeson.Value -> Aeson.Value
+unwrapStreamFrame value = case value of
+  Aeson.Array elements
+    | [single] <- toList elements -> single
+  _ -> value
 
-    errorTriple e = (,,) <$> e .: "code" <*> e .:? "status" <*> e .:? "message"
+-- | Classify a Firestore error envelope, @{"error": {"code", "status",
+-- "message"}}@, when the value has that shape.
+classifyErrorValue :: Aeson.Value -> Maybe FirestoreError
+classifyErrorValue = parseMaybe errorEnvelope
+  where
+    errorEnvelope = Aeson.withObject "response" $ \o ->
+      o .: "error" >>= Aeson.withObject "error" errorObject
+
+    errorObject e = classifyError <$> e .: "code" <*> e .:? "status" <*> e .:? "message"
 
 -- | Classify a Firestore error by HTTP code and gRPC status.
 classifyError :: Int -> Maybe Text -> Maybe Text -> FirestoreError
@@ -392,13 +407,16 @@ decodeDocumentList body = decodeBody body >>= documentsField
 -- only some carry a document (the final entry may be @readTime@-only).
 --
 -- A result object whose document fails to decode is an error, not a
--- skipped entry.
+-- skipped entry. An entry carrying an @error@ (a mid-stream failure) is
+-- reported too, rather than dropped as a non-document entry.
 decodeQueryResults :: LBS.ByteString -> Either FirestoreError [Document]
 decodeQueryResults body =
   decodeBody body >>= fmap catMaybes . traverse resultDocument
   where
-    resultDocument (Aeson.Object o) =
-      traverse (fromAesonResult . Aeson.fromJSON) (KM.lookup "document" o)
+    resultDocument value@(Aeson.Object o) =
+      case classifyErrorValue value of
+        Just err -> Left err
+        Nothing -> traverse (fromAesonResult . Aeson.fromJSON) (KM.lookup "document" o)
     resultDocument _ = Left (InvalidResponse "expected a query result object")
 
 -- | Decode a @:beginTransaction@ response to extract the transaction ID.
