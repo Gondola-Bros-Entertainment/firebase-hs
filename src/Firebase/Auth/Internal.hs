@@ -1,7 +1,6 @@
 -- |
 -- Module      : Firebase.Auth.Internal
 -- Description : Encoding and header primitives shared across the auth layers
--- License     : BSD-3-Clause
 --
 -- Primitives shared by the JWT verifier and the WAI and Servant
 -- integrations. Everything here is pure and depends only on the wire

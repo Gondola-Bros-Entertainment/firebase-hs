@@ -1,7 +1,6 @@
 -- |
 -- Module      : Firebase.Firestore
 -- Description : Firestore REST API client
--- License     : BSD-3-Clause
 --
 -- CRUD operations, structured queries, and atomic transactions against the
 -- Firestore REST API. All operations return @'Either' 'FirestoreError' a@ -

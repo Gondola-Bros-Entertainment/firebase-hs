@@ -1,7 +1,6 @@
 -- |
 -- Module      : Firebase.Firestore.Query
 -- Description : Structured query DSL for Firestore
--- License     : BSD-3-Clause
 --
 -- A pure builder-pattern DSL for constructing Firestore structured queries.
 -- Compose with @(&)@ from "Data.Function":

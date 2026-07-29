@@ -1,7 +1,6 @@
 -- |
 -- Module      : Firebase.Servant
 -- Description : Servant auth combinator for Firebase
--- License     : BSD-3-Clause
 --
 -- One-liner Firebase authentication for Servant servers. Use
 -- 'firebaseAuthHandler' to create an 'AuthHandler' that verifies

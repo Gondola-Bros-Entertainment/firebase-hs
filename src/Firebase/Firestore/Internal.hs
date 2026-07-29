@@ -1,7 +1,6 @@
 -- |
 -- Module      : Firebase.Firestore.Internal
 -- Description : Pure URL builders, request helpers, and response decoders
--- License     : BSD-3-Clause
 --
 -- Internal utilities for constructing Firestore REST API URLs and requests
 -- and for decoding its responses. All functions are pure and testable
