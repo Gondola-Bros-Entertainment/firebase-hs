@@ -131,9 +131,13 @@ jobs:
   # ---------------------------------------------------------------------------
   # GHC compatibility (Linux-only).
   #
-  # The library's version bounds claim a GHC range wider than the matrix
-  # above builds. This job is what makes that claim honest, and what keeps a
-  # boot-library bump (containers, time) from silently going out of range.
+  # Boot libraries ship with the compiler, so a bound on containers, time, or
+  # base can only be exercised by the GHC that carries that version. This job
+  # is what makes the declared range honest: containers < 0.8 once excluded
+  # every GHC from 9.10 on, and no amount of testing on 9.8 would show it.
+  #
+  # 9.8 is absent deliberately: the build matrix above already covers it on
+  # Linux with both flags enabled, which is a superset of this job.
   # ---------------------------------------------------------------------------
 
   ghc-compat:
@@ -143,7 +147,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ghc: ['9.6', '9.8', '9.10', '9.12']
+        ghc: ['9.6', '9.10', '9.12']
     steps:
       - uses: actions/checkout@v6
 
