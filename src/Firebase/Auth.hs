@@ -136,7 +136,7 @@ parseSignInProvider o =
   o .:? "firebase"
     >>= maybe (pure Nothing) (Aeson.withObject "firebase" (.:? "sign_in_provider"))
 
--- | Claim names Firebase reserves, which 'setCustomUserClaims' may not set.
+-- | Claim names Firebase reserves, which @setCustomUserClaims@ may not set.
 --
 -- Everything outside this set is a custom claim and is surfaced as one.
 reservedClaims :: Set Text

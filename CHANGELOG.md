@@ -23,6 +23,11 @@
 - A query result whose document fails to decode is reported as
   `InvalidResponse` instead of being silently dropped, which misreported
   what the query matched.
+- `integerValue` strings outside the `Int64` range are rejected. The digits
+  were read straight into `Int64`, so an out-of-range value silently
+  wrapped instead of failing.
+- `{"doubleValue": null}` is rejected. The null previously fell through to
+  aeson's `Double` parser, which reads JSON null as NaN.
 - A cache refresh no longer overwrites a newer key set installed by a
   concurrent verification.
 
@@ -92,6 +97,9 @@
 - Widened bounds: `http-client-tls < 0.5` (resolves the Stackage report in
   issue #1), `containers < 0.9`, `aeson < 2.4`, `time < 1.17`,
   `crypton < 2`. Lowered `base` to `>= 4.18`, admitting GHC 9.6.
+- `http-client >= 0.7.13`, the first release whose `Show Request` redacts
+  the `Authorization` header. An `HttpException` rendered into
+  `NetworkError` text therefore never carries the access token.
 - CI builds the `wai` and `servant` modules, which no job previously
   compiled, and adds a GHC compatibility matrix, an sdist build, and an
   ASCII-only source check.

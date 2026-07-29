@@ -41,6 +41,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
+import Data.Bits (toIntegralSized)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64 as B64
 import Data.Int (Int64)
@@ -223,14 +224,16 @@ encodeDouble d
   | otherwise = Aeson.toJSON d
 
 -- | Parse a double, accepting the proto3 string spellings of the
--- non-finite values alongside plain JSON numbers.
+-- non-finite values alongside plain JSON numbers. Only numbers reach the
+-- aeson parser: delegating JSON null would silently read it as NaN.
 parseDoubleValue :: Aeson.Value -> Parser Double
 parseDoubleValue (Aeson.String t)
   | t == nanLiteral = pure notANumber
   | t == positiveInfinityLiteral = pure positiveInfinity
   | t == negativeInfinityLiteral = pure (negate positiveInfinity)
   | otherwise = fail ("invalid doubleValue: " ++ T.unpack t)
-parseDoubleValue v = parseJSON v
+parseDoubleValue v@(Aeson.Number _) = parseJSON v
+parseDoubleValue _ = fail "invalid doubleValue: expected a number or a non-finite string"
 
 instance ToJSON FirestoreValue where
   toJSON NullValue = Aeson.object ["nullValue" .= Aeson.Null]
@@ -273,11 +276,16 @@ parseBytesValue = Aeson.withText "bytesValue" $ \t ->
 
 -- | Parse an integer value from a JSON string (Firestore's wire format).
 -- Uses decimal-only parsing: hex, octal, and other Haskell literals are
--- rejected rather than silently accepted.
+-- rejected rather than silently accepted. The digits are read as an
+-- unbounded 'Integer' and bounds-checked, because reading 'Int64' directly
+-- would silently wrap on overflow.
 parseIntegerValue :: Aeson.Value -> Parser Int64
 parseIntegerValue = Aeson.withText "integerValue" $ \t ->
-  case TR.signed TR.decimal t of
-    Right (n, remaining) | T.null remaining -> pure n
+  case TR.signed TR.decimal t :: Either String (Integer, Text) of
+    Right (n, remaining)
+      | T.null remaining,
+        Just bounded <- toIntegralSized n ->
+          pure bounded
     _ -> fail ("invalid integerValue: " ++ T.unpack t)
 
 -- | Parse a timestamp from an RFC 3339 string.

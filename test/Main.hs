@@ -303,7 +303,19 @@ valueRoundtripTests =
         Just (DoubleValue d) -> shouldHold "NaN decodes to NaN" (isNaN d)
         other -> Left ("expected a DoubleValue, got " <> show other),
     Test "DoubleValue rejects an unknown string spelling" $
-      (Aeson.decode "{\"doubleValue\":\"fast\"}" :: Maybe FirestoreValue) `shouldBe` Nothing
+      (Aeson.decode "{\"doubleValue\":\"fast\"}" :: Maybe FirestoreValue) `shouldBe` Nothing,
+    Test "DoubleValue rejects JSON null" $
+      (Aeson.decode "{\"doubleValue\":null}" :: Maybe FirestoreValue) `shouldBe` Nothing,
+    Test "IntegerValue parses the Int64 bounds" $
+      Aeson.decode "{\"integerValue\":\"9223372036854775807\"}"
+        `shouldBe` Just (IntegerValue maxBound)
+        >> Aeson.decode "{\"integerValue\":\"-9223372036854775808\"}"
+          `shouldBe` Just (IntegerValue minBound),
+    Test "IntegerValue rejects a value past the Int64 bounds" $
+      (Aeson.decode "{\"integerValue\":\"9223372036854775808\"}" :: Maybe FirestoreValue)
+        `shouldBe` Nothing
+        >> (Aeson.decode "{\"integerValue\":\"-9223372036854775809\"}" :: Maybe FirestoreValue)
+          `shouldBe` Nothing
   ]
 
 -- | Encode then decode, and confirm nothing was lost.
