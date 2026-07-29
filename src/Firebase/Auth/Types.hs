@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Auth.Types
 -- Description : Types for Firebase JWT verification
@@ -18,29 +15,30 @@ module Firebase.Auth.Types
 
     -- * Errors
     AuthError (..),
+    authErrorMessage,
 
     -- * Key Cache
+    -- $keycache
     KeyCache (..),
 
     -- * JWK Types
     JwkKey (..),
     JwkSet (..),
-
-    -- * Internal (re-exported for Firebase.Auth)
-    padBase64Url,
   )
 where
 
-import Control.Concurrent.STM (TVar)
 import Crypto.PubKey.RSA.Types (PublicKey (..))
 import Data.Aeson (FromJSON (..), Object, withObject, (.:))
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64URL
+import qualified Data.ByteString.Lazy as LBS
+import Data.IORef (IORef)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Time (NominalDiffTime, UTCTime)
+import Firebase.Auth.Internal (padBase64Url)
 import Network.HTTP.Client (Manager)
 
 -- ---------------------------------------------------------------------------
@@ -104,18 +102,36 @@ data AuthError
     MalformedToken !Text
   deriving (Eq, Show)
 
+-- | Render an 'AuthError' as a message safe to return to a client.
+--
+-- The 'Text' payloads carried by 'KeyFetchError', 'InvalidClaims', and
+-- 'MalformedToken' name internal specifics, so they are deliberately
+-- dropped here: they belong in your logs, not in a 401 body.
+authErrorMessage :: AuthError -> LBS.ByteString
+authErrorMessage (KeyFetchError _) = "Authentication service unavailable"
+authErrorMessage InvalidSignature = "Invalid token signature"
+authErrorMessage TokenExpired = "Token expired"
+authErrorMessage (InvalidClaims _) = "Invalid token claims"
+authErrorMessage (MalformedToken _) = "Malformed token"
+
 -- ---------------------------------------------------------------------------
 -- Key cache
 -- ---------------------------------------------------------------------------
 
+-- $keycache
+-- The cache is created by "Firebase.Auth", which re-exports t'KeyCache' as an
+-- abstract type. Its fields are visible here only so the verifier can reach
+-- them, and are not part of the supported API.
+
 -- | Cached store of Google's public JWKs.
 --
--- Create with 'Firebase.Auth.newKeyCache'. Keys are refreshed automatically
--- when expired (per Google's @Cache-Control: max-age@ header).
--- Thread-safe via STM — concurrent verifications compose atomically.
+-- Create with 'Firebase.Auth.newKeyCache' or 'Firebase.Auth.newTlsKeyCache'.
+-- Keys are refreshed automatically when expired (per Google's
+-- @Cache-Control: max-age@ header). Safe to share across threads: updates go
+-- through 'Data.IORef.atomicModifyIORef''.
 data KeyCache = KeyCache
-  { -- | Cached JWK set and its expiry time (STM for atomic concurrent access).
-    kcKeysRef :: !(TVar (JwkSet, UTCTime)),
+  { -- | Cached JWK set paired with the instant it stops being valid.
+    kcKeysRef :: !(IORef (JwkSet, UTCTime)),
     -- | HTTP manager for fetching keys from Google.
     kcManager :: !Manager
   }
@@ -157,22 +173,25 @@ parseRsaKey kid o = do
   eB64 <- o .: "e"
   case (,) <$> decodeBase64Url nB64 <*> decodeBase64Url eB64 of
     Left err -> fail err
-    Right (nBytes, eBytes) ->
-      let keySize = BS.length nBytes
-       in pure $ JwkKey kid (PublicKey keySize (bsToInteger nBytes) (bsToInteger eBytes))
+    Right (modulus, publicExponent) ->
+      pure $
+        JwkKey
+          kid
+          ( PublicKey
+              (BS.length modulus)
+              (bsToInteger modulus)
+              (bsToInteger publicExponent)
+          )
 
--- | Decode a base64url-encoded text value, adding padding as needed.
+-- | Decode a base64url-encoded text value, restoring its padding first.
 decodeBase64Url :: Text -> Either String BS.ByteString
 decodeBase64Url = B64URL.decode . padBase64Url . TE.encodeUtf8
 
--- | Add padding to a base64url-encoded string (JWK/JWT use unpadded base64url).
-padBase64Url :: BS.ByteString -> BS.ByteString
-padBase64Url bs =
-  let remainder = BS.length bs `mod` 4
-   in if remainder == 0
-        then bs
-        else bs <> BS.replicate (4 - remainder) 0x3d -- '='
+-- | Number of distinct values a byte can take, the radix of a big-endian
+-- byte string read as an integer.
+byteRadix :: Integer
+byteRadix = 256
 
 -- | Convert a big-endian unsigned 'BS.ByteString' to an 'Integer'.
 bsToInteger :: BS.ByteString -> Integer
-bsToInteger = BS.foldl' (\acc w -> acc * 256 + fromIntegral w) 0
+bsToInteger = BS.foldl' (\acc byte -> acc * byteRadix + fromIntegral byte) 0

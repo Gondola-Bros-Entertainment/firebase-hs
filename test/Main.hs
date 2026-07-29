@@ -1,284 +1,267 @@
-{-# LANGUAGE OverloadedStrings #-}
-
 module Main (main) where
 
 import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
 import Data.Function ((&))
 import Data.List (nub)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text as T
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, parseTimeOrError)
 import Firebase.Auth
+import Firebase.Auth.Internal (bearerToken, padBase64Url, stripBearerPrefix)
+import Firebase.Firestore (mkDeleteWrite, mkUpdateWrite)
 import Firebase.Firestore.Internal
 import Firebase.Firestore.Query
 import Firebase.Firestore.Types
-import Network.HTTP.Client (parseRequest, requestHeaders)
-import Network.HTTP.Types.Header (hCacheControl)
+import Network.HTTP.Client (Request, parseRequest, requestHeaders)
+import Network.HTTP.Types.Header (hAuthorization, hCacheControl)
 import System.Exit (exitFailure)
 
+-- ---------------------------------------------------------------------------
+-- Test framework
+--
+-- Every check below is a pure value. IO appears once, in 'main', to report
+-- the results and set the exit code.
+-- ---------------------------------------------------------------------------
+
+-- | A named check that either holds or explains why it does not.
+data Test = Test !String !(Either String ())
+
+-- | Assert that a computed value matches an expected one.
+--
+-- Fixed at comparison precedence, so the expected side can be built up with
+-- '<>' and sequenced with '>>' without parentheses.
+infix 4 `shouldBe`
+
+shouldBe :: (Eq a, Show a) => a -> a -> Either String ()
+shouldBe actual expected
+  | actual == expected = Right ()
+  | otherwise = Left ("expected " <> show expected <> ", got " <> show actual)
+
+-- | Assert that a condition holds, describing it if it does not.
+shouldHold :: String -> Bool -> Either String ()
+shouldHold _ True = Right ()
+shouldHold description False = Left ("expected " <> description)
+
+-- | Run every check in order, reporting each and failing the suite if any did.
 main :: IO ()
 main = do
   putStrLn "firebase-hs tests"
   putStrLn "=================="
-  results <-
-    sequence
-      [ -- Auth: Config
-        test "defaultFirebaseConfig sets project ID" testDefaultConfigProjectId,
-        test "defaultFirebaseConfig sets 300s clock skew" testDefaultConfigClockSkew,
-        -- Auth: Cache-Control parsing
-        test "parseCacheMaxAge parses valid header" testParseCacheMaxAgeValid,
-        test "parseCacheMaxAge handles missing header" testParseCacheMaxAgeMissing,
-        test "parseCacheMaxAge handles malformed value" testParseCacheMaxAgeMalformed,
-        test "parseCacheMaxAge rejects zero" testParseCacheMaxAgeZero,
-        test "parseCacheMaxAge rejects negative" testParseCacheMaxAgeNegative,
-        -- Auth: Types
-        test "FirebaseUser Eq instance" testFirebaseUserEq,
-        test "AuthError constructors" testAuthErrorConstructors,
-        -- Firestore: Value JSON roundtrips
-        test "FirestoreValue NullValue roundtrip" testNullValueRoundtrip,
-        test "FirestoreValue BoolValue roundtrip" testBoolValueRoundtrip,
-        test "FirestoreValue IntegerValue roundtrip" testIntegerValueRoundtrip,
-        test "FirestoreValue DoubleValue roundtrip" testDoubleValueRoundtrip,
-        test "FirestoreValue StringValue roundtrip" testStringValueRoundtrip,
-        test "FirestoreValue TimestampValue roundtrip" testTimestampValueRoundtrip,
-        test "FirestoreValue ArrayValue roundtrip" testArrayValueRoundtrip,
-        test "FirestoreValue MapValue roundtrip" testMapValueRoundtrip,
-        -- Firestore: Integer encoding as string
-        test "IntegerValue encodes as JSON string" testIntegerEncodesAsString,
-        -- Firestore: Document decoding
-        test "Document decodes from Firestore JSON" testDocumentDecode,
-        test "Document decodes with empty fields" testDocumentDecodeEmptyFields,
-        -- Firestore: Error types
-        test "FirestoreError constructors" testFirestoreErrorConstructors,
-        -- Firestore: URL construction
-        test "documentUrl builds correct URL" testDocumentUrl,
-        test "collectionUrl builds correct URL" testCollectionUrl,
-        test "createDocUrl builds correct URL" testCreateDocUrl,
-        test "updateDocUrl with fields builds correct URL" testUpdateDocUrlWithFields,
-        test "updateDocUrl without fields builds correct URL" testUpdateDocUrlNoFields,
-        test "queryUrl builds correct URL" testQueryUrl,
-        test "beginTransactionUrl builds correct URL" testBeginTransactionUrl,
-        test "commitUrl builds correct URL" testCommitUrl,
-        test "rollbackUrl builds correct URL" testRollbackUrl,
-        -- Firestore: Query DSL
-        test "query encodes basic collection" testQueryBasic,
-        test "query encodes with field filter" testQueryWithFilter,
-        test "query encodes with orderBy and limit" testQueryWithOrderByLimit,
-        test "query encodes composite AND filter" testQueryCompositeAnd,
-        test "query encodes composite OR filter" testQueryCompositeOr,
-        test "query encodes with offset" testQueryWithOffset,
-        test "query encodes Descending order" testQueryDescending,
-        test "all FilterOp values encode correctly" testAllFilterOpEncodings,
-        -- Firestore: Transaction options encoding
-        test "ReadWrite transaction options encode" testReadWriteEncode,
-        test "RetryWith transaction options encode" testRetryWithEncode,
-        test "ReadOnly transaction options encode" testReadOnlyEncode,
-        -- Firestore: Request helpers
-        test "authorizeRequest adds Bearer header" testAuthorizeRequest,
-        -- Firestore: Error parsing
-        test "parseFirestoreError 404" testParseError404,
-        test "parseFirestoreError 403" testParseError403,
-        test "parseFirestoreError 409 ABORTED" testParseError409Aborted,
-        test "parseFirestoreError unparseable" testParseErrorUnparseable
-      ]
-  let failures = length (filter not results)
-  if failures > 0
-    then do
-      putStrLn ("\n" ++ show failures ++ " test(s) FAILED")
+  mapM_ (putStrLn . report) tests
+  case filter failed tests of
+    [] -> putStrLn ("\nAll " <> show (length tests) <> " tests passed.")
+    failures -> do
+      putStrLn ("\n" <> show (length failures) <> " test(s) FAILED")
       exitFailure
-    else putStrLn "\nAll tests passed."
-
--- ---------------------------------------------------------------------------
--- Test runner
--- ---------------------------------------------------------------------------
-
-test :: String -> IO Bool -> IO Bool
-test name action = do
-  result <- action
-  putStrLn (indicator result ++ " " ++ name)
-  pure result
   where
-    indicator True = "  PASS"
-    indicator False = "  FAIL"
+    failed (Test _ result) = either (const True) (const False) result
 
-assertEqual :: (Eq a, Show a) => String -> a -> a -> IO Bool
-assertEqual label expected actual
-  | expected == actual = pure True
-  | otherwise = do
-      putStrLn ("    " ++ label ++ ": expected " ++ show expected ++ ", got " ++ show actual)
-      pure False
+    report (Test name (Right ())) = "  PASS " <> name
+    report (Test name (Left reason)) = "  FAIL " <> name <> "\n    " <> reason
 
 -- ---------------------------------------------------------------------------
--- Auth: Config tests
+-- Test registry
 -- ---------------------------------------------------------------------------
 
-testDefaultConfigProjectId :: IO Bool
-testDefaultConfigProjectId =
-  assertEqual "fcProjectId" "test-project" (fcProjectId (defaultFirebaseConfig "test-project"))
-
-testDefaultConfigClockSkew :: IO Bool
-testDefaultConfigClockSkew =
-  assertEqual "fcClockSkew" 300 (fcClockSkew (defaultFirebaseConfig "test-project"))
-
--- ---------------------------------------------------------------------------
--- Auth: Cache-Control parsing tests
--- ---------------------------------------------------------------------------
-
-testParseCacheMaxAgeValid :: IO Bool
-testParseCacheMaxAgeValid =
-  assertEqual
-    "max-age=19845"
-    (Just 19845)
-    (parseCacheMaxAge [(hCacheControl, "public, max-age=19845, must-revalidate, no-transform")])
-
-testParseCacheMaxAgeMissing :: IO Bool
-testParseCacheMaxAgeMissing =
-  assertEqual
-    "no Cache-Control header"
-    Nothing
-    (parseCacheMaxAge [("content-type", "application/json")])
-
-testParseCacheMaxAgeMalformed :: IO Bool
-testParseCacheMaxAgeMalformed =
-  assertEqual
-    "max-age=abc"
-    Nothing
-    (parseCacheMaxAge [(hCacheControl, "max-age=abc")])
-
-testParseCacheMaxAgeZero :: IO Bool
-testParseCacheMaxAgeZero =
-  assertEqual
-    "max-age=0"
-    Nothing
-    (parseCacheMaxAge [(hCacheControl, "max-age=0")])
-
-testParseCacheMaxAgeNegative :: IO Bool
-testParseCacheMaxAgeNegative =
-  assertEqual
-    "max-age=-1"
-    Nothing
-    (parseCacheMaxAge [(hCacheControl, "max-age=-1")])
+tests :: [Test]
+tests =
+  concat
+    [ authConfigTests,
+      cacheControlTests,
+      authErrorTests,
+      bearerTokenTests,
+      base64Tests,
+      valueRoundtripTests,
+      documentTests,
+      urlTests,
+      urlEncodingTests,
+      resourceNameTests,
+      writeTests,
+      queryTests,
+      transactionOptionTests,
+      requestTests,
+      errorParsingTests
+    ]
 
 -- ---------------------------------------------------------------------------
--- Auth: Type tests
+-- Auth: Config
 -- ---------------------------------------------------------------------------
 
-testFirebaseUserEq :: IO Bool
-testFirebaseUserEq =
-  let u1 = FirebaseUser "uid1" (Just "a@b.com") (Just "Alice")
-      u2 = FirebaseUser "uid1" (Just "a@b.com") (Just "Alice")
-   in assertEqual "same users" u1 u2
+authConfigTests :: [Test]
+authConfigTests =
+  [ Test "defaultFirebaseConfig sets project ID" $
+      fcProjectId (defaultFirebaseConfig "test-project") `shouldBe` "test-project",
+    Test "defaultFirebaseConfig sets 300s clock skew" $
+      fcClockSkew (defaultFirebaseConfig "test-project") `shouldBe` 300
+  ]
 
-testAuthErrorConstructors :: IO Bool
-testAuthErrorConstructors = do
-  let errors =
+-- ---------------------------------------------------------------------------
+-- Auth: Cache-Control parsing
+-- ---------------------------------------------------------------------------
+
+cacheControlTests :: [Test]
+cacheControlTests =
+  [ Test "parseCacheMaxAge parses valid header" $
+      parseCacheMaxAge [(hCacheControl, "public, max-age=19845, must-revalidate, no-transform")]
+        `shouldBe` Just 19845,
+    Test "parseCacheMaxAge handles missing header" $
+      parseCacheMaxAge [("content-type", "application/json")] `shouldBe` Nothing,
+    Test "parseCacheMaxAge handles malformed value" $
+      parseCacheMaxAge [(hCacheControl, "max-age=abc")] `shouldBe` Nothing,
+    Test "parseCacheMaxAge rejects zero" $
+      parseCacheMaxAge [(hCacheControl, "max-age=0")] `shouldBe` Nothing,
+    Test "parseCacheMaxAge rejects negative" $
+      parseCacheMaxAge [(hCacheControl, "max-age=-1")] `shouldBe` Nothing,
+    Test "parseCacheMaxAge ignores unrelated directives" $
+      parseCacheMaxAge [(hCacheControl, "no-store, must-revalidate")] `shouldBe` Nothing,
+    Test "parseCacheMaxAge reads a directive in final position" $
+      parseCacheMaxAge [(hCacheControl, "public, max-age=60")] `shouldBe` Just 60
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Auth: Errors
+-- ---------------------------------------------------------------------------
+
+authErrorTests :: [Test]
+authErrorTests =
+  [ Test "FirebaseUser Eq instance" $
+      FirebaseUser "uid1" (Just "a@b.com") (Just "Alice")
+        `shouldBe` FirebaseUser "uid1" (Just "a@b.com") (Just "Alice"),
+    Test "AuthError constructors" $
+      length
         [ KeyFetchError "network error",
           InvalidSignature,
           TokenExpired,
           InvalidClaims "bad aud",
           MalformedToken "not a jwt"
         ]
-  assertEqual "5 constructors" 5 (length errors)
+        `shouldBe` 5,
+    Test "authErrorMessage withholds the key-fetch detail" $
+      authErrorMessage (KeyFetchError "connect to 10.0.0.1 refused")
+        `shouldBe` "Authentication service unavailable",
+    Test "authErrorMessage withholds which claim failed" $
+      authErrorMessage (InvalidClaims "audience mismatch") `shouldBe` "Invalid token claims",
+    Test "authErrorMessage withholds the parse detail" $
+      authErrorMessage (MalformedToken "header: invalid base64") `shouldBe` "Malformed token",
+    Test "authErrorMessage distinguishes signature from expiry" $
+      shouldHold "different messages" $
+        authErrorMessage InvalidSignature /= authErrorMessage TokenExpired
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Auth: Bearer token extraction
+-- ---------------------------------------------------------------------------
+
+bearerTokenTests :: [Test]
+bearerTokenTests =
+  [ Test "stripBearerPrefix accepts the canonical scheme" $
+      stripBearerPrefix "Bearer abc.def.ghi" `shouldBe` Just "abc.def.ghi",
+    Test "stripBearerPrefix accepts a lowercase scheme" $
+      stripBearerPrefix "bearer abc.def.ghi" `shouldBe` Just "abc.def.ghi",
+    Test "stripBearerPrefix accepts an uppercase scheme" $
+      stripBearerPrefix "BEARER abc.def.ghi" `shouldBe` Just "abc.def.ghi",
+    Test "stripBearerPrefix rejects another scheme" $
+      stripBearerPrefix "Basic dXNlcjpwYXNz" `shouldBe` Nothing,
+    Test "stripBearerPrefix rejects a bare token" $
+      stripBearerPrefix "abc.def.ghi" `shouldBe` Nothing,
+    Test "stripBearerPrefix rejects an empty header" $
+      stripBearerPrefix "" `shouldBe` Nothing,
+    Test "stripBearerPrefix keeps an empty credential" $
+      stripBearerPrefix "Bearer " `shouldBe` Just "",
+    Test "bearerToken reads the Authorization header" $
+      bearerToken [(hAuthorization, "Bearer token123")] `shouldBe` Just "token123",
+    Test "bearerToken matches the header name case-insensitively" $
+      bearerToken [("authorization", "Bearer token123")] `shouldBe` Just "token123",
+    Test "bearerToken ignores other headers" $
+      bearerToken [("content-type", "application/json")] `shouldBe` Nothing,
+    Test "bearerToken rejects a malformed scheme" $
+      bearerToken [(hAuthorization, "Bearer2 token123")] `shouldBe` Nothing
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Auth: base64url padding
+-- ---------------------------------------------------------------------------
+
+base64Tests :: [Test]
+base64Tests =
+  [ Test "padBase64Url leaves a whole group alone" $
+      padBase64Url "YWJjZA==" `shouldBe` "YWJjZA==",
+    Test "padBase64Url pads a two-character remainder" $
+      padBase64Url "YWJjZA" `shouldBe` "YWJjZA==",
+    Test "padBase64Url pads a three-character remainder" $
+      padBase64Url "YWJjZGU" `shouldBe` "YWJjZGU=",
+    Test "padBase64Url leaves empty input alone" $
+      padBase64Url "" `shouldBe` "",
+    Test "padBase64Url always yields a whole number of groups" $
+      shouldHold "every padded length divisible by 4" $
+        all (\s -> BS.length (padBase64Url s) `rem` 4 == 0) ["", "a", "ab", "abc", "abcd", "abcde"]
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Value JSON roundtrips
 -- ---------------------------------------------------------------------------
 
--- | Roundtrip: encode then decode, verify identity.
-roundtrip :: FirestoreValue -> IO Bool
-roundtrip val =
-  assertEqual (show val) (Just val) (Aeson.decode (Aeson.encode val))
+valueRoundtripTests :: [Test]
+valueRoundtripTests =
+  [ Test "FirestoreValue NullValue roundtrip" (roundtrip NullValue),
+    Test "FirestoreValue BoolValue roundtrip" (roundtrip (BoolValue True) >> roundtrip (BoolValue False)),
+    Test "FirestoreValue IntegerValue roundtrip" $
+      roundtrip (IntegerValue 0) >> roundtrip (IntegerValue 42) >> roundtrip (IntegerValue (-100)),
+    Test "FirestoreValue DoubleValue roundtrip" (roundtrip (DoubleValue 3.14)),
+    Test "FirestoreValue StringValue roundtrip" (roundtrip (StringValue "hello world")),
+    Test "FirestoreValue TimestampValue roundtrip" $
+      roundtrip (TimestampValue (parseUTC "2024-01-15T10:30:00Z")),
+    Test "FirestoreValue ArrayValue roundtrip" $
+      roundtrip (ArrayValue [StringValue "a", IntegerValue 1, BoolValue True]),
+    Test "FirestoreValue MapValue roundtrip" $
+      roundtrip (MapValue (Map.fromList [("name", StringValue "Alice"), ("age", IntegerValue 30)])),
+    Test "IntegerValue encodes as a JSON string" $
+      Aeson.encode (IntegerValue 42)
+        `shouldBe` Aeson.encode (Aeson.object ["integerValue" Aeson..= ("42" :: Text)]),
+    Test "IntegerValue rejects a hexadecimal literal" $
+      (Aeson.decode "{\"integerValue\":\"0x2A\"}" :: Maybe FirestoreValue) `shouldBe` Nothing,
+    Test "IntegerValue rejects trailing characters" $
+      (Aeson.decode "{\"integerValue\":\"42abc\"}" :: Maybe FirestoreValue) `shouldBe` Nothing
+  ]
 
-testNullValueRoundtrip :: IO Bool
-testNullValueRoundtrip = roundtrip NullValue
-
-testBoolValueRoundtrip :: IO Bool
-testBoolValueRoundtrip = do
-  r1 <- roundtrip (BoolValue True)
-  r2 <- roundtrip (BoolValue False)
-  pure (r1 && r2)
-
-testIntegerValueRoundtrip :: IO Bool
-testIntegerValueRoundtrip = do
-  r1 <- roundtrip (IntegerValue 0)
-  r2 <- roundtrip (IntegerValue 42)
-  r3 <- roundtrip (IntegerValue (-100))
-  pure (r1 && r2 && r3)
-
-testDoubleValueRoundtrip :: IO Bool
-testDoubleValueRoundtrip = roundtrip (DoubleValue 3.14)
-
-testStringValueRoundtrip :: IO Bool
-testStringValueRoundtrip = roundtrip (StringValue "hello world")
-
-testTimestampValueRoundtrip :: IO Bool
-testTimestampValueRoundtrip = roundtrip (TimestampValue (parseUTC "2024-01-15T10:30:00Z"))
-
-testArrayValueRoundtrip :: IO Bool
-testArrayValueRoundtrip =
-  roundtrip (ArrayValue [StringValue "a", IntegerValue 1, BoolValue True])
-
-testMapValueRoundtrip :: IO Bool
-testMapValueRoundtrip =
-  roundtrip
-    ( MapValue
-        ( Map.fromList
-            [("name", StringValue "Alice"), ("age", IntegerValue 30)]
-        )
-    )
-
--- | Verify IntegerValue encodes as a JSON string, not a number.
-testIntegerEncodesAsString :: IO Bool
-testIntegerEncodesAsString =
-  let encoded = Aeson.encode (IntegerValue 42)
-      expected = Aeson.encode (Aeson.object ["integerValue" Aeson..= ("42" :: Text)])
-   in assertEqual "integer encodes as string" expected encoded
+-- | Encode then decode, and confirm nothing was lost.
+roundtrip :: FirestoreValue -> Either String ()
+roundtrip val = Aeson.decode (Aeson.encode val) `shouldBe` Just val
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Document decoding
 -- ---------------------------------------------------------------------------
 
-testDocumentDecode :: IO Bool
-testDocumentDecode =
-  let json =
+documentTests :: [Test]
+documentTests =
+  [ Test "Document decodes from Firestore JSON" $
+      Aeson.decode
         "{ \"name\": \"projects/p/databases/(default)/documents/users/alice\"\
         \, \"fields\": { \"name\": { \"stringValue\": \"Alice\" }\
         \              , \"age\": { \"integerValue\": \"30\" } }\
         \, \"createTime\": \"2024-01-15T10:30:00Z\"\
         \, \"updateTime\": \"2024-06-20T14:45:00Z\" }"
-      expected =
-        Document
-          { docName = "projects/p/databases/(default)/documents/users/alice",
-            docFields =
-              Map.fromList
-                [ ("name", StringValue "Alice"),
-                  ("age", IntegerValue 30)
-                ],
-            docCreateTime = Just (parseUTC "2024-01-15T10:30:00Z"),
-            docUpdateTime = Just (parseUTC "2024-06-20T14:45:00Z")
-          }
-   in assertEqual "full document" (Just expected) (Aeson.decode json)
-
-testDocumentDecodeEmptyFields :: IO Bool
-testDocumentDecodeEmptyFields =
-  let json = "{ \"name\": \"projects/p/databases/(default)/documents/col/doc\" }"
-      expected =
-        Document
-          { docName = "projects/p/databases/(default)/documents/col/doc",
-            docFields = Map.empty,
-            docCreateTime = Nothing,
-            docUpdateTime = Nothing
-          }
-   in assertEqual "empty fields" (Just expected) (Aeson.decode json)
-
--- ---------------------------------------------------------------------------
--- Firestore: Error types
--- ---------------------------------------------------------------------------
-
-testFirestoreErrorConstructors :: IO Bool
-testFirestoreErrorConstructors = do
-  let errors =
+        `shouldBe` Just
+          Document
+            { docName = "projects/p/databases/(default)/documents/users/alice",
+              docFields = Map.fromList [("name", StringValue "Alice"), ("age", IntegerValue 30)],
+              docCreateTime = Just (parseUTC "2024-01-15T10:30:00Z"),
+              docUpdateTime = Just (parseUTC "2024-06-20T14:45:00Z")
+            },
+    Test "Document decodes with empty fields" $
+      Aeson.decode "{ \"name\": \"projects/p/databases/(default)/documents/col/doc\" }"
+        `shouldBe` Just
+          Document
+            { docName = "projects/p/databases/(default)/documents/col/doc",
+              docFields = Map.empty,
+              docCreateTime = Nothing,
+              docUpdateTime = Nothing
+            },
+    Test "FirestoreError constructors" $
+      length
         [ DocumentNotFound,
           PermissionDenied "no access",
           NetworkError "timeout",
@@ -286,371 +269,359 @@ testFirestoreErrorConstructors = do
           FirestoreApiError 500 "INTERNAL" "oops",
           TransactionAborted "contention"
         ]
-  assertEqual "6 constructors" 6 (length errors)
+        `shouldBe` 6
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Firestore: URL construction
 -- ---------------------------------------------------------------------------
 
-testDocumentUrl :: IO Bool
-testDocumentUrl =
-  assertEqual
-    "documentUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents/users/alice"
-    (documentUrl (ProjectId "myproj") (DocumentPath (CollectionPath "users") (DocumentId "alice")))
+-- | Project used by the URL tests.
+testProject :: ProjectId
+testProject = ProjectId "myproj"
 
-testCollectionUrl :: IO Bool
-testCollectionUrl =
-  assertEqual
-    "collectionUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents/users"
-    (collectionUrl (ProjectId "myproj") (CollectionPath "users"))
+-- | Prefix every document URL under 'testProject' shares.
+testDatabaseUrl :: String
+testDatabaseUrl = "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents"
 
-testCreateDocUrl :: IO Bool
-testCreateDocUrl =
-  assertEqual
-    "createDocUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents/users?documentId=alice"
-    (createDocUrl (ProjectId "myproj") (CollectionPath "users") (DocumentId "alice"))
+alicePath :: DocumentPath
+alicePath = DocumentPath (CollectionPath "users") (DocumentId "alice")
 
-testUpdateDocUrlWithFields :: IO Bool
-testUpdateDocUrlWithFields =
-  assertEqual
-    "updateDocUrl with fields"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents/users/alice?updateMask.fieldPaths=name&updateMask.fieldPaths=age"
-    (updateDocUrl (ProjectId "myproj") (DocumentPath (CollectionPath "users") (DocumentId "alice")) ["name", "age"])
+urlTests :: [Test]
+urlTests =
+  [ Test "databaseUrl builds correct URL" $
+      databaseUrl testProject `shouldBe` testDatabaseUrl,
+    Test "documentUrl builds correct URL" $
+      documentUrl testProject alicePath `shouldBe` testDatabaseUrl <> "/users/alice",
+    Test "collectionUrl builds correct URL" $
+      collectionUrl testProject (CollectionPath "users") `shouldBe` testDatabaseUrl <> "/users",
+    Test "createDocUrl builds correct URL" $
+      createDocUrl testProject (CollectionPath "users") (DocumentId "alice")
+        `shouldBe` testDatabaseUrl
+        <> "/users?documentId=alice",
+    Test "updateDocUrl with fields builds correct URL" $
+      updateDocUrl testProject alicePath ["name", "age"]
+        `shouldBe` testDatabaseUrl
+        <> "/users/alice?updateMask.fieldPaths=name&updateMask.fieldPaths=age",
+    Test "updateDocUrl without fields builds correct URL" $
+      updateDocUrl testProject alicePath [] `shouldBe` testDatabaseUrl <> "/users/alice",
+    Test "queryUrl builds correct URL" $
+      queryUrl testProject `shouldBe` testDatabaseUrl <> ":runQuery",
+    Test "beginTransactionUrl builds correct URL" $
+      beginTransactionUrl testProject `shouldBe` testDatabaseUrl <> ":beginTransaction",
+    Test "commitUrl builds correct URL" $
+      commitUrl testProject `shouldBe` testDatabaseUrl <> ":commit",
+    Test "rollbackUrl builds correct URL" $
+      rollbackUrl testProject `shouldBe` testDatabaseUrl <> ":rollback",
+    Test "collectionUrl keeps subcollection separators" $
+      collectionUrl testProject (CollectionPath "users/abc/posts")
+        `shouldBe` testDatabaseUrl
+        <> "/users/abc/posts"
+  ]
 
-testUpdateDocUrlNoFields :: IO Bool
-testUpdateDocUrlNoFields =
-  assertEqual
-    "updateDocUrl no fields"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents/users/alice"
-    (updateDocUrl (ProjectId "myproj") (DocumentPath (CollectionPath "users") (DocumentId "alice")) [])
+-- ---------------------------------------------------------------------------
+-- Firestore: Percent encoding
+--
+-- Caller-supplied components reach the URL encoded, so a value carrying a
+-- URL delimiter names a document instead of altering the request.
+-- ---------------------------------------------------------------------------
 
-testQueryUrl :: IO Bool
-testQueryUrl =
-  assertEqual
-    "queryUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:runQuery"
-    (queryUrl (ProjectId "myproj"))
+urlEncodingTests :: [Test]
+urlEncodingTests =
+  [ Test "encodePathSegment escapes a path separator" $
+      encodePathSegment "a/b" `shouldBe` "a%2Fb",
+    Test "encodePathSegment escapes a query introducer" $
+      encodePathSegment "a?b" `shouldBe` "a%3Fb",
+    Test "encodePathSegment escapes a fragment introducer" $
+      encodePathSegment "a#b" `shouldBe` "a%23b",
+    Test "encodePathSegment escapes a space" $
+      encodePathSegment "a b" `shouldBe` "a%20b",
+    Test "encodePathSegment escapes a percent" $
+      encodePathSegment "a%b" `shouldBe` "a%25b",
+    Test "encodePathSegment encodes non-ASCII as UTF-8" $
+      encodePathSegment (T.pack "caf\233") `shouldBe` "caf%C3%A9",
+    Test "encodePathSegment leaves unreserved characters alone" $
+      encodePathSegment "aZ0.~-_" `shouldBe` "aZ0.~-_",
+    Test "encodeQueryValue escapes a parameter separator" $
+      encodeQueryValue "a&b" `shouldBe` "a%26b",
+    Test "encodeQueryValue escapes an assignment" $
+      encodeQueryValue "a=b" `shouldBe` "a%3Db",
+    Test "documentUrl escapes a document ID" $
+      documentUrl testProject (DocumentPath (CollectionPath "users") (DocumentId "a?b#c"))
+        `shouldBe` testDatabaseUrl
+        <> "/users/a%3Fb%23c",
+    Test "documentUrl escapes a project ID" $
+      documentUrl (ProjectId "a b") alicePath
+        `shouldBe` "https://firestore.googleapis.com/v1/projects/a%20b/databases/(default)/documents/users/alice",
+    Test "createDocUrl escapes a document ID in the query" $
+      createDocUrl testProject (CollectionPath "users") (DocumentId "a&b=c")
+        `shouldBe` testDatabaseUrl
+        <> "/users?documentId=a%26b%3Dc",
+    Test "updateDocUrl escapes field paths" $
+      updateDocUrl testProject alicePath ["a&b"]
+        `shouldBe` testDatabaseUrl
+        <> "/users/alice?updateMask.fieldPaths=a%26b",
+    Test "collectionUrl escapes within a subcollection segment" $
+      collectionUrl testProject (CollectionPath "users/a b/posts")
+        `shouldBe` testDatabaseUrl
+        <> "/users/a%20b/posts"
+  ]
 
-testBeginTransactionUrl :: IO Bool
-testBeginTransactionUrl =
-  assertEqual
-    "beginTransactionUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:beginTransaction"
-    (beginTransactionUrl (ProjectId "myproj"))
+-- ---------------------------------------------------------------------------
+-- Firestore: Resource names
+-- ---------------------------------------------------------------------------
 
-testCommitUrl :: IO Bool
-testCommitUrl =
-  assertEqual
-    "commitUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:commit"
-    (commitUrl (ProjectId "myproj"))
+resourceNameTests :: [Test]
+resourceNameTests =
+  [ Test "documentResourceName builds the full path" $
+      documentResourceName testProject alicePath
+        `shouldBe` "projects/myproj/databases/(default)/documents/users/alice",
+    Test "documentResourceName carries components verbatim" $
+      documentResourceName testProject (DocumentPath (CollectionPath "users") (DocumentId "a b"))
+        `shouldBe` "projects/myproj/databases/(default)/documents/users/a b",
+    Test "documentResourceName matches a decoded document's name" $
+      documentResourceName (ProjectId "p") (DocumentPath (CollectionPath "users") (DocumentId "alice"))
+        `shouldBe` "projects/p/databases/(default)/documents/users/alice"
+  ]
 
-testRollbackUrl :: IO Bool
-testRollbackUrl =
-  assertEqual
-    "rollbackUrl"
-    "https://firestore.googleapis.com/v1/projects/myproj/databases/(default)/documents:rollback"
-    (rollbackUrl (ProjectId "myproj"))
+-- ---------------------------------------------------------------------------
+-- Firestore: Transaction writes
+-- ---------------------------------------------------------------------------
+
+writeTests :: [Test]
+writeTests =
+  [ Test "mkUpdateWrite encodes name and fields" $
+      mkUpdateWrite testProject alicePath (Map.fromList [("age", IntegerValue 31)])
+        `shouldBe` Aeson.object
+          [ "update"
+              Aeson..= Aeson.object
+                [ "name" Aeson..= (T.pack (testResourcePrefix <> "/users/alice") :: Text),
+                  "fields"
+                    Aeson..= Aeson.object
+                      ["age" Aeson..= Aeson.object ["integerValue" Aeson..= ("31" :: Text)]]
+                ]
+          ],
+    Test "mkDeleteWrite encodes the document name" $
+      mkDeleteWrite testProject alicePath
+        `shouldBe` Aeson.object
+          ["delete" Aeson..= (T.pack (testResourcePrefix <> "/users/alice") :: Text)],
+    Test "mkUpdateWrite accepts an empty field map" $
+      mkUpdateWrite testProject alicePath Map.empty
+        `shouldBe` Aeson.object
+          [ "update"
+              Aeson..= Aeson.object
+                [ "name" Aeson..= (T.pack (testResourcePrefix <> "/users/alice") :: Text),
+                  "fields" Aeson..= Aeson.object []
+                ]
+          ]
+  ]
+  where
+    testResourcePrefix = "projects/myproj/databases/(default)/documents"
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Query DSL
 -- ---------------------------------------------------------------------------
 
-testQueryBasic :: IO Bool
-testQueryBasic =
-  let q = encodeQuery (query (CollectionPath "users"))
-      expected =
-        Aeson.object
-          [ "structuredQuery"
-              Aeson..= Aeson.object
-                ["from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]]]
-          ]
-   in assertEqual "basic query" expected q
+-- | Wrap a structured-query body in the envelope 'encodeQuery' produces.
+structuredQuery :: [(Aeson.Key, Aeson.Value)] -> Aeson.Value
+structuredQuery body = Aeson.object ["structuredQuery" Aeson..= Aeson.object body]
 
-testQueryWithFilter :: IO Bool
-testQueryWithFilter =
-  let q =
-        encodeQuery $
-          query (CollectionPath "users")
-            & where_ (fieldFilter "age" OpGreaterThan (IntegerValue 18))
-      expected =
-        Aeson.object
-          [ "structuredQuery"
-              Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
-                  "where"
-                    Aeson..= Aeson.object
-                      [ "fieldFilter"
-                          Aeson..= Aeson.object
-                            [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("age" :: Text)],
-                              "op" Aeson..= ("GREATER_THAN" :: Text),
-                              "value" Aeson..= Aeson.object ["integerValue" Aeson..= ("18" :: Text)]
-                            ]
-                      ]
-                ]
-          ]
-   in assertEqual "query with field filter" expected q
+-- | The @from@ clause naming a single collection.
+fromCollection :: Text -> (Aeson.Key, Aeson.Value)
+fromCollection name = "from" Aeson..= [Aeson.object ["collectionId" Aeson..= name]]
 
-testQueryWithOrderByLimit :: IO Bool
-testQueryWithOrderByLimit =
-  let q =
-        encodeQuery $
-          query (CollectionPath "users")
-            & orderBy "name" Ascending
-            & limit 25
-      expected =
-        Aeson.object
-          [ "structuredQuery"
-              Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
-                  "orderBy"
-                    Aeson..= [ Aeson.object
-                                 [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("name" :: Text)],
-                                   "direction" Aeson..= ("ASCENDING" :: Text)
-                                 ]
-                             ],
-                  "limit" Aeson..= (25 :: Int)
-                ]
+-- | A @fieldFilter@ as it appears on the wire.
+wireFieldFilter :: Text -> Text -> Aeson.Value -> Aeson.Value
+wireFieldFilter field op value =
+  Aeson.object
+    [ "fieldFilter"
+        Aeson..= Aeson.object
+          [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= field],
+            "op" Aeson..= op,
+            "value" Aeson..= value
           ]
-   in assertEqual "query with orderBy and limit" expected q
+    ]
 
-testQueryCompositeAnd :: IO Bool
-testQueryCompositeAnd =
-  let q =
-        encodeQuery $
-          query (CollectionPath "users")
+-- | An @integerValue@ as it appears on the wire.
+wireInteger :: Text -> Aeson.Value
+wireInteger n = Aeson.object ["integerValue" Aeson..= n]
+
+-- | An @orderBy@ entry as it appears on the wire.
+wireOrderBy :: Text -> Text -> Aeson.Value
+wireOrderBy field direction =
+  Aeson.object
+    [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= field],
+      "direction" Aeson..= direction
+    ]
+
+queryTests :: [Test]
+queryTests =
+  [ Test "query encodes basic collection" $
+      encodeQuery (query (CollectionPath "users")) `shouldBe` structuredQuery [fromCollection "users"],
+    Test "query encodes with field filter" $
+      encodeQuery (query (CollectionPath "users") & where_ (fieldFilter "age" OpGreaterThan (IntegerValue 18)))
+        `shouldBe` structuredQuery
+          [ fromCollection "users",
+            "where" Aeson..= wireFieldFilter "age" "GREATER_THAN" (wireInteger "18")
+          ],
+    Test "query encodes with orderBy and limit" $
+      encodeQuery (query (CollectionPath "users") & orderBy "name" Ascending & limit 25)
+        `shouldBe` structuredQuery
+          [ fromCollection "users",
+            "orderBy" Aeson..= [wireOrderBy "name" "ASCENDING"],
+            "limit" Aeson..= (25 :: Int)
+          ],
+    Test "query encodes composite AND filter" $
+      encodeQuery
+        ( query (CollectionPath "users")
             & where_
               ( compositeAnd
                   [ fieldFilter "age" OpGreaterThan (IntegerValue 18),
                     fieldFilter "active" OpEqual (BoolValue True)
                   ]
               )
-      expected =
-        Aeson.object
-          [ "structuredQuery"
+        )
+        `shouldBe` structuredQuery
+          [ fromCollection "users",
+            "where"
               Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
-                  "where"
+                [ "compositeFilter"
                     Aeson..= Aeson.object
-                      [ "compositeFilter"
-                          Aeson..= Aeson.object
-                            [ "op" Aeson..= ("AND" :: Text),
-                              "filters"
-                                Aeson..= [ Aeson.object
-                                             [ "fieldFilter"
-                                                 Aeson..= Aeson.object
-                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("age" :: Text)],
-                                                     "op" Aeson..= ("GREATER_THAN" :: Text),
-                                                     "value" Aeson..= Aeson.object ["integerValue" Aeson..= ("18" :: Text)]
-                                                   ]
-                                             ],
-                                           Aeson.object
-                                             [ "fieldFilter"
-                                                 Aeson..= Aeson.object
-                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("active" :: Text)],
-                                                     "op" Aeson..= ("EQUAL" :: Text),
-                                                     "value" Aeson..= Aeson.object ["booleanValue" Aeson..= True]
-                                                   ]
-                                             ]
-                                         ]
-                            ]
+                      [ "op" Aeson..= ("AND" :: Text),
+                        "filters"
+                          Aeson..= [ wireFieldFilter "age" "GREATER_THAN" (wireInteger "18"),
+                                     wireFieldFilter "active" "EQUAL" (Aeson.object ["booleanValue" Aeson..= True])
+                                   ]
                       ]
                 ]
-          ]
-   in assertEqual "query with composite AND filter" expected q
-
-testQueryCompositeOr :: IO Bool
-testQueryCompositeOr =
-  let q =
-        encodeQuery $
-          query (CollectionPath "users")
+          ],
+    Test "query encodes composite OR filter" $
+      encodeQuery
+        ( query (CollectionPath "users")
             & where_
               ( compositeOr
                   [ fieldFilter "role" OpEqual (StringValue "admin"),
                     fieldFilter "role" OpEqual (StringValue "moderator")
                   ]
               )
-      expected =
-        Aeson.object
-          [ "structuredQuery"
+        )
+        `shouldBe` structuredQuery
+          [ fromCollection "users",
+            "where"
               Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("users" :: Text)]],
-                  "where"
+                [ "compositeFilter"
                     Aeson..= Aeson.object
-                      [ "compositeFilter"
-                          Aeson..= Aeson.object
-                            [ "op" Aeson..= ("OR" :: Text),
-                              "filters"
-                                Aeson..= [ Aeson.object
-                                             [ "fieldFilter"
-                                                 Aeson..= Aeson.object
-                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("role" :: Text)],
-                                                     "op" Aeson..= ("EQUAL" :: Text),
-                                                     "value" Aeson..= Aeson.object ["stringValue" Aeson..= ("admin" :: Text)]
-                                                   ]
-                                             ],
-                                           Aeson.object
-                                             [ "fieldFilter"
-                                                 Aeson..= Aeson.object
-                                                   [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("role" :: Text)],
-                                                     "op" Aeson..= ("EQUAL" :: Text),
-                                                     "value" Aeson..= Aeson.object ["stringValue" Aeson..= ("moderator" :: Text)]
-                                                   ]
-                                             ]
-                                         ]
-                            ]
+                      [ "op" Aeson..= ("OR" :: Text),
+                        "filters"
+                          Aeson..= [ wireFieldFilter "role" "EQUAL" (Aeson.object ["stringValue" Aeson..= ("admin" :: Text)]),
+                                     wireFieldFilter "role" "EQUAL" (Aeson.object ["stringValue" Aeson..= ("moderator" :: Text)])
+                                   ]
                       ]
                 ]
-          ]
-   in assertEqual "query with composite OR filter" expected q
+          ],
+    Test "query encodes with offset" $
+      encodeQuery (query (CollectionPath "items") & offset 50 & limit 25)
+        `shouldBe` structuredQuery
+          [ fromCollection "items",
+            "limit" Aeson..= (25 :: Int),
+            "offset" Aeson..= (50 :: Int)
+          ],
+    Test "query encodes Descending order" $
+      encodeQuery (query (CollectionPath "posts") & orderBy "createdAt" Descending)
+        `shouldBe` structuredQuery
+          [ fromCollection "posts",
+            "orderBy" Aeson..= [wireOrderBy "createdAt" "DESCENDING"]
+          ],
+    Test "orderBy clauses accumulate in order" $
+      encodeQuery (query (CollectionPath "posts") & orderBy "a" Ascending & orderBy "b" Descending)
+        `shouldBe` structuredQuery
+          [ fromCollection "posts",
+            "orderBy" Aeson..= [wireOrderBy "a" "ASCENDING", wireOrderBy "b" "DESCENDING"]
+          ],
+    Test "all FilterOp values encode distinctly" $
+      shouldHold "10 distinct encodings" (length encodings == length (nub encodings))
+        >> length allOps `shouldBe` 10
+  ]
+  where
+    encodings = map encodeOp allOps
+    encodeOp op = Aeson.encode (encodeQuery (query (CollectionPath "c") & where_ (fieldFilter "f" op (StringValue "v"))))
+    allOps =
+      [ OpEqual,
+        OpNotEqual,
+        OpLessThan,
+        OpLessThanOrEqual,
+        OpGreaterThan,
+        OpGreaterThanOrEqual,
+        OpArrayContains,
+        OpIn,
+        OpArrayContainsAny,
+        OpNotIn
+      ]
 
-testQueryWithOffset :: IO Bool
-testQueryWithOffset =
-  let q =
-        encodeQuery $
-          query (CollectionPath "items")
-            & offset 50
-            & limit 25
-      expected =
-        Aeson.object
-          [ "structuredQuery"
-              Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("items" :: Text)]],
-                  "limit" Aeson..= (25 :: Int),
-                  "offset" Aeson..= (50 :: Int)
-                ]
-          ]
-   in assertEqual "query with offset" expected q
+-- ---------------------------------------------------------------------------
+-- Firestore: Transaction options
+-- ---------------------------------------------------------------------------
 
-testQueryDescending :: IO Bool
-testQueryDescending =
-  let q =
-        encodeQuery $
-          query (CollectionPath "posts")
-            & orderBy "createdAt" Descending
-      expected =
-        Aeson.object
-          [ "structuredQuery"
-              Aeson..= Aeson.object
-                [ "from" Aeson..= [Aeson.object ["collectionId" Aeson..= ("posts" :: Text)]],
-                  "orderBy"
-                    Aeson..= [ Aeson.object
-                                 [ "field" Aeson..= Aeson.object ["fieldPath" Aeson..= ("createdAt" :: Text)],
-                                   "direction" Aeson..= ("DESCENDING" :: Text)
-                                 ]
-                             ]
-                ]
-          ]
-   in assertEqual "query with Descending order" expected q
-
-testAllFilterOpEncodings :: IO Bool
-testAllFilterOpEncodings =
-  let encodeOp op =
-        let q =
-              encodeQuery $
-                query (CollectionPath "c")
-                  & where_ (fieldFilter "f" op (StringValue "v"))
-         in Aeson.encode q
-      -- Each operator must produce a distinct, non-empty encoding
-      allEncodings = map encodeOp allOps
-      allOps =
-        [ OpEqual,
-          OpNotEqual,
-          OpLessThan,
-          OpLessThanOrEqual,
-          OpGreaterThan,
-          OpGreaterThanOrEqual,
-          OpArrayContains,
-          OpIn,
-          OpArrayContainsAny,
-          OpNotIn
-        ]
-      allDistinct = length allEncodings == length (nub allEncodings)
-   in do
-        r1 <- assertEqual "10 ops" 10 (length allOps)
-        r2 <- assertEqual "all distinct" True allDistinct
-        pure (r1 && r2)
+transactionOptionTests :: [Test]
+transactionOptionTests =
+  [ Test "ReadWrite transaction options encode" $
+      encodeTransactionOptions ReadWrite
+        `shouldBe` transactionOptions ["readWrite" Aeson..= Aeson.object []],
+    Test "RetryWith transaction options encode" $
+      encodeTransactionOptions (RetryWith (TransactionId "abc123"))
+        `shouldBe` transactionOptions
+          ["readWrite" Aeson..= Aeson.object ["retryTransaction" Aeson..= ("abc123" :: Text)]],
+    Test "ReadOnly transaction options encode" $
+      encodeTransactionOptions ReadOnly
+        `shouldBe` transactionOptions ["readOnly" Aeson..= Aeson.object []],
+    Test "TransactionId Show does not leak the token" $
+      shouldHold "redacted" (show (TransactionId "super-secret") == "TransactionId <redacted>"),
+    Test "AccessToken Show does not leak the token" $
+      shouldHold "redacted" (show (AccessToken "ya29.super-secret") == "AccessToken <redacted>")
+  ]
+  where
+    transactionOptions body = Aeson.object ["options" Aeson..= Aeson.object body]
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Request helpers
 -- ---------------------------------------------------------------------------
 
-testAuthorizeRequest :: IO Bool
-testAuthorizeRequest = do
-  baseReq <- parseRequest "https://example.com"
-  let tok = AccessToken "test-token-123"
-      authorized = authorizeRequest tok baseReq
-      authHeader = lookup "Authorization" (requestHeaders authorized)
-  assertEqual "Authorization header" (Just "Bearer test-token-123") authHeader
-
--- ---------------------------------------------------------------------------
--- Firestore: Transaction options encoding
--- ---------------------------------------------------------------------------
-
-testReadWriteEncode :: IO Bool
-testReadWriteEncode =
-  let encoded = encodeTransactionOptions ReadWrite
-      expected =
-        Aeson.object
-          [ "options"
-              Aeson..= Aeson.object
-                ["readWrite" Aeson..= Aeson.object []]
-          ]
-   in assertEqual "ReadWrite" expected encoded
-
-testRetryWithEncode :: IO Bool
-testRetryWithEncode =
-  let encoded = encodeTransactionOptions (RetryWith (TransactionId "abc123"))
-      expected =
-        Aeson.object
-          [ "options"
-              Aeson..= Aeson.object
-                [ "readWrite"
-                    Aeson..= Aeson.object
-                      ["retryTransaction" Aeson..= ("abc123" :: Text)]
-                ]
-          ]
-   in assertEqual "RetryWith" expected encoded
-
-testReadOnlyEncode :: IO Bool
-testReadOnlyEncode =
-  let encoded = encodeTransactionOptions ReadOnly
-      expected =
-        Aeson.object
-          [ "options"
-              Aeson..= Aeson.object
-                ["readOnly" Aeson..= Aeson.object []]
-          ]
-   in assertEqual "ReadOnly" expected encoded
+requestTests :: [Test]
+requestTests =
+  [ Test "authorizeRequest adds Bearer header" $
+      case parseRequest "https://example.com" :: Maybe Request of
+        Nothing -> Left "parseRequest rejected a valid URL"
+        Just req ->
+          lookup hAuthorization (requestHeaders (authorizeRequest (AccessToken "test-token-123") req))
+            `shouldBe` Just "Bearer test-token-123"
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Firestore: Error parsing
 -- ---------------------------------------------------------------------------
 
-testParseError404 :: IO Bool
-testParseError404 =
-  let body = "{\"error\":{\"code\":404,\"message\":\"not found\",\"status\":\"NOT_FOUND\"}}"
-   in assertEqual "404 -> DocumentNotFound" DocumentNotFound (parseFirestoreError 404 body)
-
-testParseError403 :: IO Bool
-testParseError403 =
-  let body = "{\"error\":{\"code\":403,\"message\":\"denied\",\"status\":\"PERMISSION_DENIED\"}}"
-   in assertEqual "403 -> PermissionDenied" (PermissionDenied "denied") (parseFirestoreError 403 body)
-
-testParseError409Aborted :: IO Bool
-testParseError409Aborted =
-  let body = "{\"error\":{\"code\":409,\"message\":\"contention\",\"status\":\"ABORTED\"}}"
-   in assertEqual "409 ABORTED -> TransactionAborted" (TransactionAborted "contention") (parseFirestoreError 409 body)
-
-testParseErrorUnparseable :: IO Bool
-testParseErrorUnparseable =
-  assertEqual
-    "unparseable -> NetworkError"
-    (NetworkError "HTTP 500")
-    (parseFirestoreError 500 "not json at all")
+errorParsingTests :: [Test]
+errorParsingTests =
+  [ Test "parseFirestoreError 404" $
+      parseFirestoreError 404 "{\"error\":{\"code\":404,\"message\":\"not found\",\"status\":\"NOT_FOUND\"}}"
+        `shouldBe` DocumentNotFound,
+    Test "parseFirestoreError 403" $
+      parseFirestoreError 403 "{\"error\":{\"code\":403,\"message\":\"denied\",\"status\":\"PERMISSION_DENIED\"}}"
+        `shouldBe` PermissionDenied "denied",
+    Test "parseFirestoreError 409 ABORTED" $
+      parseFirestoreError 409 "{\"error\":{\"code\":409,\"message\":\"contention\",\"status\":\"ABORTED\"}}"
+        `shouldBe` TransactionAborted "contention",
+    Test "parseFirestoreError unparseable" $
+      parseFirestoreError 500 "not json at all" `shouldBe` NetworkError "HTTP 500",
+    Test "parseFirestoreError JSON without an error object" $
+      parseFirestoreError 500 "{\"unexpected\":true}" `shouldBe` NetworkError "HTTP 500",
+    Test "parseFirestoreError keeps an unclassified status" $
+      parseFirestoreError 500 "{\"error\":{\"code\":500,\"message\":\"boom\",\"status\":\"INTERNAL\"}}"
+        `shouldBe` FirestoreApiError 500 "INTERNAL" "boom",
+    Test "parseFirestoreError tolerates a missing message" $
+      parseFirestoreError 403 "{\"error\":{\"code\":403,\"status\":\"PERMISSION_DENIED\"}}"
+        `shouldBe` PermissionDenied ""
+  ]
 
 -- ---------------------------------------------------------------------------
 -- Helpers

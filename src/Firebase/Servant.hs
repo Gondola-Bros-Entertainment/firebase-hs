@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Servant
 -- Description : Servant auth combinator for Firebase
@@ -22,33 +19,33 @@
 --       ctx     = firebaseAuthHandler cache cfg :. EmptyContext
 --   runSettings defaultSettings (serveWithContext api ctx server)
 -- @
+--
+-- The token is extracted with 'Firebase.Auth.Internal.bearerToken' and
+-- failures are rendered with 'Firebase.Auth.authErrorMessage', so this
+-- combinator admits exactly the requests "Firebase.Auth.WAI" does and
+-- refuses them with the same wording.
 module Firebase.Servant
   ( -- * Auth Handler
     firebaseAuthHandler,
-
-    -- * Helpers (pure, testable)
-    extractBearerToken,
-    authErrorToBody,
   )
 where
 
-import Control.Monad.Except (throwError)
 import Control.Monad.IO.Class (liftIO)
-import qualified Data.ByteString as BS
+import Control.Monad.Trans.Except (throwE)
 import qualified Data.ByteString.Lazy as LBS
-import Firebase.Auth (verifyIdTokenCached)
-import Firebase.Auth.Types (AuthError (..), FirebaseConfig, FirebaseUser, KeyCache)
+import Firebase.Auth (FirebaseConfig, FirebaseUser, KeyCache, authErrorMessage, verifyIdTokenCached)
+import Firebase.Auth.Internal (bearerToken)
 import Network.Wai (Request, requestHeaders)
-import Servant.Server (Handler, err401, errBody)
+import Servant.Server (Handler (..), err401, errBody)
 import Servant.Server.Experimental.Auth (AuthHandler, mkAuthHandler)
 
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
 
--- | The @\"Bearer \"@ prefix length (7 bytes).
-bearerPrefixLen :: Int
-bearerPrefixLen = 7
+-- | Response body when no bearer token was supplied at all.
+missingHeaderMessage :: LBS.ByteString
+missingHeaderMessage = "Missing or malformed Authorization header"
 
 -- ---------------------------------------------------------------------------
 -- Auth Handler
@@ -60,42 +57,20 @@ bearerPrefixLen = 7
 -- against Google's public keys using the cached key store, and returns
 -- the authenticated 'FirebaseUser'.
 --
--- On failure, returns HTTP 401 with a descriptive error body.
+-- On failure, returns HTTP 401 with a body that names the failure without
+-- disclosing which claim or key was at fault.
 firebaseAuthHandler ::
   KeyCache -> FirebaseConfig -> AuthHandler Request FirebaseUser
 firebaseAuthHandler cache cfg = mkAuthHandler $ \req ->
-  case extractBearerToken req of
-    Nothing -> throw401 "Missing or malformed Authorization header"
-    Just tok -> do
-      result <- liftIO (verifyIdTokenCached cache cfg tok)
-      either (throw401 . authErrorToBody) pure result
+  case bearerToken (requestHeaders req) of
+    Nothing -> throw401 missingHeaderMessage
+    Just token -> do
+      result <- liftIO (verifyIdTokenCached cache cfg token)
+      either (throw401 . authErrorMessage) pure result
 
--- | Throw a 401 error in the Servant 'Handler' monad.
+-- | Throw a 401 error in the Servant t'Handler' monad.
+--
+-- Built on the t'Handler' newtype rather than @MonadError@, which keeps this
+-- working across servant versions without depending on @mtl@.
 throw401 :: LBS.ByteString -> Handler a
-throw401 msg = throwError (err401 {errBody = msg})
-
--- ---------------------------------------------------------------------------
--- Pure Helpers
--- ---------------------------------------------------------------------------
-
--- | Extract a Bearer token from a WAI 'Request'.
---
--- Looks for the @Authorization@ header and strips the @\"Bearer \"@ prefix.
--- Returns 'Nothing' if the header is missing or doesn't start with @\"Bearer \"@.
-extractBearerToken :: Request -> Maybe BS.ByteString
-extractBearerToken req = do
-  hdr <- lookup "Authorization" (requestHeaders req)
-  if "Bearer " `BS.isPrefixOf` hdr
-    then Just (BS.drop bearerPrefixLen hdr)
-    else Nothing
-
--- | Convert an 'AuthError' to a safe response message.
---
--- Internal details (JOSE errors, claim specifics) are hidden to prevent
--- information leakage. Matches the error messages used by 'Firebase.Auth.WAI'.
-authErrorToBody :: AuthError -> LBS.ByteString
-authErrorToBody (KeyFetchError _) = "Authentication service unavailable"
-authErrorToBody InvalidSignature = "Invalid token signature"
-authErrorToBody TokenExpired = "Token expired"
-authErrorToBody (InvalidClaims _) = "Invalid token claims"
-authErrorToBody (MalformedToken _) = "Malformed token"
+throw401 msg = Handler (throwE err401 {errBody = msg})

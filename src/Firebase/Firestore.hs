@@ -1,13 +1,10 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Firestore
 -- Description : Firestore REST API client
 -- License     : BSD-3-Clause
 --
 -- CRUD operations, structured queries, and atomic transactions against the
--- Firestore REST API. All operations return @'Either' 'FirestoreError' a@ —
+-- Firestore REST API. All operations return @'Either' 'FirestoreError' a@ -
 -- no exceptions are thrown for API-level errors.
 --
 -- @
@@ -40,6 +37,10 @@ module Firebase.Firestore
     rollbackTransaction,
     runTransaction,
 
+    -- * Transaction Writes
+    mkUpdateWrite,
+    mkDeleteWrite,
+
     -- * HTTP Manager
     newTlsManager,
 
@@ -54,9 +55,12 @@ import Control.Monad.Trans.Except (ExceptT (..), runExceptT)
 import Data.Aeson ((.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KM
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
+import Data.Functor (void)
 import Data.Map.Strict (Map)
+import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Firebase.Firestore.Internal
@@ -76,19 +80,23 @@ import Network.HTTP.Client
     responseStatus,
   )
 import Network.HTTP.Client.TLS (newTlsManager)
-import Network.HTTP.Types.Status (statusCode)
+import Network.HTTP.Types.Header (hContentType)
+import Network.HTTP.Types.Method
+  ( Method,
+    methodDelete,
+    methodGet,
+    methodPatch,
+    methodPost,
+  )
+import Network.HTTP.Types.Status (statusCode, statusIsSuccessful)
 
 -- ---------------------------------------------------------------------------
--- HTTP status code constants
+-- Constants
 -- ---------------------------------------------------------------------------
 
--- | HTTP 200 OK.
-httpOk :: Int
-httpOk = 200
-
--- | Upper bound for successful HTTP status codes (exclusive).
-httpSuccessUpperBound :: Int
-httpSuccessUpperBound = 300
+-- | Media type of every request body this client sends.
+applicationJson :: BS.ByteString
+applicationJson = "application/json"
 
 -- ---------------------------------------------------------------------------
 -- CRUD Operations
@@ -102,7 +110,7 @@ getDocument ::
   DocumentPath ->
   IO (Either FirestoreError Document)
 getDocument mgr tok pid dp =
-  fmap (>>= decodeDocument) (doGet mgr tok (documentUrl pid dp))
+  fmap (>>= decodeBody) (doGet mgr tok (documentUrl pid dp))
 
 -- | Create a document with a specific ID in a collection.
 createDocument ::
@@ -114,8 +122,7 @@ createDocument ::
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
 createDocument mgr tok pid cp did fields =
-  let body = Aeson.encode (Aeson.object ["fields" .= fields])
-   in fmap (>>= decodeDocument) (doPost mgr tok (createDocUrl pid cp did) body)
+  fmap (>>= decodeBody) (doPost mgr tok (createDocUrl pid cp did) (encodeFields fields))
 
 -- | Update a document's fields. Pass field names to update specific fields,
 -- or an empty list to replace all fields.
@@ -128,8 +135,7 @@ updateDocument ::
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
 updateDocument mgr tok pid dp fieldPaths fields =
-  let body = Aeson.encode (Aeson.object ["fields" .= fields])
-   in fmap (>>= decodeDocument) (doPatch mgr tok (updateDocUrl pid dp fieldPaths) body)
+  fmap (>>= decodeBody) (doPatch mgr tok (updateDocUrl pid dp fieldPaths) (encodeFields fields))
 
 -- | Delete a document by path.
 deleteDocument ::
@@ -139,7 +145,11 @@ deleteDocument ::
   DocumentPath ->
   IO (Either FirestoreError ())
 deleteDocument mgr tok pid dp =
-  fmap (>> Right ()) (doRequest mgr tok (documentUrl pid dp) "DELETE" Nothing)
+  fmap void (doRequest mgr tok (documentUrl pid dp) methodDelete Nothing)
+
+-- | Encode a field map as a Firestore write body.
+encodeFields :: Map Text FirestoreValue -> LBS.ByteString
+encodeFields fields = Aeson.encode (Aeson.object ["fields" .= fields])
 
 -- ---------------------------------------------------------------------------
 -- Queries
@@ -153,8 +163,9 @@ runQuery ::
   StructuredQuery ->
   IO (Either FirestoreError [Document])
 runQuery mgr tok pid sq =
-  let body = Aeson.encode (encodeQuery sq)
-   in fmap (>>= decodeQueryResults) (doPost mgr tok (queryUrl pid) body)
+  fmap (>>= decodeQueryResults) (doPost mgr tok (queryUrl pid) body)
+  where
+    body = Aeson.encode (encodeQuery sq)
 
 -- ---------------------------------------------------------------------------
 -- Transactions
@@ -168,8 +179,9 @@ beginTransaction ::
   TransactionMode ->
   IO (Either FirestoreError TransactionId)
 beginTransaction mgr tok pid mode =
-  let body = Aeson.encode (encodeTransactionOptions mode)
-   in fmap (>>= decodeTransactionId) (doPost mgr tok (beginTransactionUrl pid) body)
+  fmap (>>= decodeTransactionId) (doPost mgr tok (beginTransactionUrl pid) body)
+  where
+    body = Aeson.encode (encodeTransactionOptions mode)
 
 -- | Commit a transaction with a list of write operations.
 commitTransaction ::
@@ -180,10 +192,9 @@ commitTransaction ::
   [Aeson.Value] ->
   IO (Either FirestoreError ())
 commitTransaction mgr tok pid (TransactionId txnId) writes =
-  let body =
-        Aeson.encode
-          (Aeson.object ["writes" .= writes, "transaction" .= txnId])
-   in fmap (>> Right ()) (doPost mgr tok (commitUrl pid) body)
+  fmap void (doPost mgr tok (commitUrl pid) body)
+  where
+    body = Aeson.encode (Aeson.object ["writes" .= writes, "transaction" .= txnId])
 
 -- | Roll back a transaction without committing.
 rollbackTransaction ::
@@ -193,8 +204,9 @@ rollbackTransaction ::
   TransactionId ->
   IO (Either FirestoreError ())
 rollbackTransaction mgr tok pid (TransactionId txnId) =
-  let body = Aeson.encode (Aeson.object ["transaction" .= txnId])
-   in fmap (>> Right ()) (doPost mgr tok (rollbackUrl pid) body)
+  fmap void (doPost mgr tok (rollbackUrl pid) body)
+  where
+    body = Aeson.encode (Aeson.object ["transaction" .= txnId])
 
 -- | Run an atomic transaction. The callback receives the transaction ID
 -- and should return a list of writes to commit.
@@ -204,9 +216,9 @@ rollbackTransaction mgr tok pid (TransactionId txnId) =
 -- Use 'RetryWith' to retry an aborted transaction.
 --
 -- @
--- runTransaction mgr tok pid ReadWrite $ \\txnId -> runExceptT $ do
+-- runTransaction mgr tok pid ReadWrite $ \\_txnId -> runExceptT $ do
 --   doc <- ExceptT $ getDocument mgr tok pid somePath
---   pure [mkUpdateWrite somePath (docFields doc)]
+--   pure [mkUpdateWrite pid somePath (bumpVersion (docFields doc))]
 -- @
 runTransaction ::
   Manager ->
@@ -216,18 +228,48 @@ runTransaction ::
   (TransactionId -> IO (Either FirestoreError [Aeson.Value])) ->
   IO (Either FirestoreError ())
 runTransaction mgr tok pid mode action = do
-  txnResult <- beginTransaction mgr tok pid mode
-  case txnResult of
-    Left err -> pure (Left err)
-    Right txnId -> do
+  started <- beginTransaction mgr tok pid mode
+  either (pure . Left) commitOrRollback started
+  where
+    commitOrRollback txnId = do
       result <- runExceptT $ do
-        writes <- ExceptT $ action txnId
-        ExceptT $ commitTransaction mgr tok pid txnId writes
-      case result of
-        Right () -> pure (Right ())
-        Left err -> do
-          _ <- rollbackTransaction mgr tok pid txnId
-          pure (Left err)
+        writes <- ExceptT (action txnId)
+        ExceptT (commitTransaction mgr tok pid txnId writes)
+      either (rollbackWith txnId) (pure . Right) result
+
+    -- The original failure is what the caller needs; a rollback that also
+    -- fails must not mask it.
+    rollbackWith txnId err = do
+      _ <- rollbackTransaction mgr tok pid txnId
+      pure (Left err)
+
+-- ---------------------------------------------------------------------------
+-- Transaction Writes
+-- ---------------------------------------------------------------------------
+
+-- | A write that sets a document's fields, creating it if absent.
+--
+-- 'commitTransaction' and the callback to 'runTransaction' take writes in
+-- Firestore's wire form; these constructors build that form so callers do
+-- not hand-assemble it.
+mkUpdateWrite ::
+  ProjectId ->
+  DocumentPath ->
+  Map Text FirestoreValue ->
+  Aeson.Value
+mkUpdateWrite pid dp fields =
+  Aeson.object
+    [ "update"
+        .= Aeson.object
+          [ "name" .= documentResourceName pid dp,
+            "fields" .= fields
+          ]
+    ]
+
+-- | A write that deletes a document.
+mkDeleteWrite :: ProjectId -> DocumentPath -> Aeson.Value
+mkDeleteWrite pid dp =
+  Aeson.object ["delete" .= documentResourceName pid dp]
 
 -- ---------------------------------------------------------------------------
 -- HTTP Helpers
@@ -236,7 +278,7 @@ runTransaction mgr tok pid mode action = do
 -- | Perform an authorized GET request.
 doGet ::
   Manager -> AccessToken -> String -> IO (Either FirestoreError LBS.ByteString)
-doGet mgr tok url = doRequest mgr tok url "GET" Nothing
+doGet mgr tok url = doRequest mgr tok url methodGet Nothing
 
 -- | Perform an authorized POST request with a JSON body.
 doPost ::
@@ -245,7 +287,7 @@ doPost ::
   String ->
   LBS.ByteString ->
   IO (Either FirestoreError LBS.ByteString)
-doPost mgr tok url body = doRequest mgr tok url "POST" (Just body)
+doPost mgr tok url body = doRequest mgr tok url methodPost (Just body)
 
 -- | Perform an authorized PATCH request with a JSON body.
 doPatch ::
@@ -254,79 +296,80 @@ doPatch ::
   String ->
   LBS.ByteString ->
   IO (Either FirestoreError LBS.ByteString)
-doPatch mgr tok url body = doRequest mgr tok url "PATCH" (Just body)
+doPatch mgr tok url body = doRequest mgr tok url methodPatch (Just body)
 
 -- | Core HTTP request executor.
 doRequest ::
   Manager ->
   AccessToken ->
   String ->
-  BS.ByteString ->
+  Method ->
   Maybe LBS.ByteString ->
   IO (Either FirestoreError LBS.ByteString)
-doRequest mgr tok url httpMethod mBody = do
-  reqResult <- try (parseRequest url) :: IO (Either SomeException Request)
-  case reqResult of
-    Left err -> pure (Left (NetworkError (T.pack (show err))))
-    Right baseReq -> do
-      let req =
-            authorizeRequest tok $
-              baseReq
-                { method = httpMethod,
-                  requestHeaders =
-                    ("Content-Type", "application/json")
-                      : requestHeaders baseReq,
-                  requestBody = maybe mempty RequestBodyLBS mBody
-                }
-      respResult <-
-        try (httpLbs req mgr) ::
-          IO (Either SomeException (Response LBS.ByteString))
-      case respResult of
-        Left err -> pure (Left (NetworkError (T.pack (show err))))
-        Right resp ->
-          let status = statusCode (responseStatus resp)
-              body = responseBody resp
-           in if status >= httpOk && status < httpSuccessUpperBound
-                then pure (Right body)
-                else pure (Left (parseFirestoreError status body))
+doRequest mgr tok url httpMethod mBody = runExceptT $ do
+  baseReq <- ExceptT (tryNetwork (parseRequest url))
+  resp <- ExceptT (tryNetwork (httpLbs (buildRequest tok httpMethod mBody baseReq) mgr))
+  ExceptT (pure (responseOrError resp))
+
+-- | Run an action that may throw, reporting any exception as a network error.
+tryNetwork :: IO a -> IO (Either FirestoreError a)
+tryNetwork action = first describe <$> try action
+  where
+    describe :: SomeException -> FirestoreError
+    describe = NetworkError . T.pack . show
+
+-- | Apply the method, headers, and body to a parsed request.
+buildRequest :: AccessToken -> Method -> Maybe LBS.ByteString -> Request -> Request
+buildRequest tok httpMethod mBody req =
+  authorizeRequest
+    tok
+    req
+      { method = httpMethod,
+        requestHeaders = (hContentType, applicationJson) : requestHeaders req,
+        requestBody = maybe mempty RequestBodyLBS mBody
+      }
+
+-- | A 2xx response yields its body; anything else is a Firestore error.
+responseOrError :: Response LBS.ByteString -> Either FirestoreError LBS.ByteString
+responseOrError resp
+  | statusIsSuccessful status = Right body
+  | otherwise = Left (parseFirestoreError (statusCode status) body)
+  where
+    status = responseStatus resp
+    body = responseBody resp
 
 -- ---------------------------------------------------------------------------
 -- Response Decoders (pure)
 -- ---------------------------------------------------------------------------
 
--- | Decode a response body as a t'Document'.
-decodeDocument :: LBS.ByteString -> Either FirestoreError Document
-decodeDocument body = case Aeson.eitherDecode body of
-  Left err -> Left (InvalidResponse (T.pack err))
-  Right doc -> Right doc
+-- | Decode a response body, reporting parse failures as 'InvalidResponse'.
+decodeBody :: (Aeson.FromJSON a) => LBS.ByteString -> Either FirestoreError a
+decodeBody = first (InvalidResponse . T.pack) . Aeson.eitherDecode
 
--- | Decode a query response (array of @{\"document\": ...}@ objects).
+-- | Decode a query response: a stream of result objects, of which only some
+-- carry a document.
 decodeQueryResults :: LBS.ByteString -> Either FirestoreError [Document]
-decodeQueryResults body = case Aeson.eitherDecode body of
-  Left err -> Left (InvalidResponse (T.pack err))
-  Right results -> Right (extractDocuments results)
+decodeQueryResults = fmap extractDocuments . decodeBody
 
 -- | Extract documents from query result objects, skipping entries without
 -- a @\"document\"@ field (e.g. the final @\"readTime\"@-only entry).
 extractDocuments :: [Aeson.Value] -> [Document]
-extractDocuments = concatMap go
+extractDocuments = mapMaybe resultDocument
   where
-    go (Aeson.Object o) = case KM.lookup "document" o of
-      Just v -> case Aeson.fromJSON v of
-        Aeson.Success doc -> [doc]
-        _ -> []
-      Nothing -> []
-    go _ = []
+    resultDocument (Aeson.Object o) = KM.lookup "document" o >>= fromResult . Aeson.fromJSON
+    resultDocument _ = Nothing
+
+    fromResult (Aeson.Success doc) = Just doc
+    fromResult (Aeson.Error _) = Nothing
 
 -- | Decode a beginTransaction response to extract the transaction ID.
 decodeTransactionId :: LBS.ByteString -> Either FirestoreError TransactionId
-decodeTransactionId body = case Aeson.eitherDecode body of
-  Left err -> Left (InvalidResponse (T.pack err))
-  Right val -> case extractTxnId val of
-    Just txnId -> Right txnId
-    Nothing -> Left (InvalidResponse "missing transaction field")
+decodeTransactionId body =
+  decodeBody body >>= maybe (Left missingTransaction) Right . transactionField
   where
-    extractTxnId (Aeson.Object o) = case KM.lookup "transaction" o of
-      Just (Aeson.String t) -> Just (TransactionId t)
+    missingTransaction = InvalidResponse "missing transaction field"
+
+    transactionField (Aeson.Object o) = case KM.lookup "transaction" o of
+      Just (Aeson.String txnId) -> Just (TransactionId txnId)
       _ -> Nothing
-    extractTxnId _ = Nothing
+    transactionField _ = Nothing

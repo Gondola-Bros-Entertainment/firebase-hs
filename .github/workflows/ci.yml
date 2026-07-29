@@ -10,17 +10,40 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Drop the default GITHUB_TOKEN to read-only; nothing here writes via it.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# ---------------------------------------------------------------------------
+# Lint jobs (fast, Linux-only)
+# ---------------------------------------------------------------------------
+
 jobs:
-  lint:
-    name: HLint
+  ascii:
+    name: ASCII source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+      - name: Source must be ASCII-only
+        run: |
+          if git grep -nP '[^\x00-\x7F]' -- '*.hs' '*.cabal' '*.md' '*.yml'; then
+            echo "Non-ASCII characters found above; keep the source ASCII-only (no smart quotes, em-dashes, or Unicode arrows)."
+            exit 1
+          fi
+
+  lint:
+    name: HLint
+    needs: [ascii]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
       - uses: haskell-actions/hlint-setup@v2
+        with:
+          version: '3.10'
       - uses: haskell-actions/hlint-run@v2
         with:
           path: '["src/", "test/"]'
@@ -28,47 +51,151 @@ jobs:
 
   format:
     name: Ormolu
+    needs: [ascii]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: haskell-actions/run-ormolu@v16
+      - uses: actions/checkout@v6
+      - uses: haskell-actions/run-ormolu@v19
         with:
+          # Pinned to the version the repo is formatted with: formatting is
+          # not stable across ormolu releases, and a floating version would
+          # fail CI on untouched code when upstream ships one. Upgrades bump
+          # this and the local binary together.
+          version: "0.8.0.2"
           pattern: |
             src/**/*.hs
             test/**/*.hs
+
+  # ---------------------------------------------------------------------------
+  # Packaging check (Linux-only)
+  # ---------------------------------------------------------------------------
 
   cabal-check:
     name: Cabal Check
     needs: [lint, format]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: '9.8'
           cabal-version: 'latest'
       - run: cabal check
 
+  # ---------------------------------------------------------------------------
+  # Build + Test (cross-platform matrix)
+  # ---------------------------------------------------------------------------
+
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.name }})
     needs: [lint, format, cabal-check]
-    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: macos-latest
+            name: macOS
+          - os: windows-latest
+            name: Windows
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
+
       - uses: haskell-actions/setup@v2
+        id: setup
         with:
           ghc-version: '9.8'
           cabal-version: 'latest'
-      - uses: actions/cache@v5
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
         with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-ghc-9.8-${{ hashFiles('firebase-hs.cabal') }}
-          restore-keys: ${{ runner.os }}-ghc-9.8-
-      - run: cabal update
-      - run: cabal build --ghc-options="-Werror"
-      - run: cabal test --enable-tests
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-${{ runner.os }}-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: cabal-${{ runner.os }}-
+
+      - name: Haddock
+        run: cabal haddock -f wai -f servant
+
+      # Both flags plus --enable-tests, so Firebase.Auth.WAI, Firebase.Servant
+      # and the test suite meet the same -Werror bar as the core library. The
+      # flags default to off, so a plain `cabal build` never compiles them.
+      - name: Build
+        run: cabal build all -f wai -f servant --enable-tests --ghc-options="-Werror"
+
+      - name: Test
+        run: cabal test -f wai -f servant --ghc-options="-Werror"
+
+  # ---------------------------------------------------------------------------
+  # GHC compatibility (Linux-only).
+  #
+  # The library's version bounds claim a GHC range wider than the matrix
+  # above builds. This job is what makes that claim honest, and what keeps a
+  # boot-library bump (containers, time) from silently going out of range.
+  # ---------------------------------------------------------------------------
+
+  ghc-compat:
+    name: GHC ${{ matrix.ghc }}
+    needs: [lint, format, cabal-check]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ghc: ['9.6', '9.8', '9.10', '9.12']
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: 'latest'
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-ghc${{ matrix.ghc }}-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: cabal-ghc${{ matrix.ghc }}-
+
+      - name: Build and test
+        run: cabal build all --enable-tests --ghc-options="-Werror"
+
+      - name: Test
+        run: cabal test
+
+  # ---------------------------------------------------------------------------
+  # Build from the sdist, exactly as a Hackage user does (Linux-only).
+  # CI otherwise builds the git tree; the tarball is what users install, and
+  # any divergence (files missing from the sdist, dev-only project settings)
+  # is invisible without this job.
+  # ---------------------------------------------------------------------------
+
+  sdist:
+    name: Build from sdist
+    needs: [lint, format]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          ghc-version: '9.8'
+          cabal-version: 'latest'
+
+      - name: Cache Cabal store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.setup.outputs.cabal-store }}
+          key: cabal-sdist-${{ hashFiles('firebase-hs.cabal') }}
+          restore-keys: cabal-sdist-
+
+      - name: Build the tarball a Hackage user gets
+        run: |
+          cabal sdist -o "$RUNNER_TEMP/sdist"
+          tar -xzf "$RUNNER_TEMP"/sdist/firebase-hs-*.tar.gz -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"/firebase-hs-*/
+          cabal build all -f wai -f servant --enable-tests

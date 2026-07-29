@@ -1,8 +1,3 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-{-# LANGUAGE TupleSections #-}
-
 -- |
 -- Module      : Firebase.Firestore.Types
 -- Description : Types for Firestore REST API
@@ -170,7 +165,8 @@ instance FromJSON FirestoreValue where
       _ -> fail "unrecognized FirestoreValue tag"
 
 -- | Parse an integer value from a JSON string (Firestore's wire format).
--- Uses decimal-only parsing — rejects hex, octal, and other Haskell literals.
+-- Uses decimal-only parsing: hex, octal, and other Haskell literals are
+-- rejected rather than silently accepted.
 parseIntegerValue :: Aeson.Value -> Parser Int64
 parseIntegerValue = Aeson.withText "integerValue" $ \t ->
   case TR.signed TR.decimal t of

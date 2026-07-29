@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Auth.WAI
 -- Description : WAI middleware for Firebase authentication
@@ -33,21 +30,34 @@ module Firebase.Auth.WAI
 where
 
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.Lazy.Char8 as LBS8
+import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Vault.Lazy as Vault
-import Firebase.Auth (verifyIdTokenCached)
-import Firebase.Auth.Types (AuthError (..), FirebaseConfig, FirebaseUser, KeyCache)
+import Firebase.Auth (FirebaseConfig, FirebaseUser, KeyCache, authErrorMessage, verifyIdTokenCached)
+import Firebase.Auth.Internal (bearerToken)
+import Network.HTTP.Types.Header (hContentType)
 import Network.HTTP.Types.Status (status401)
-import Network.Wai (Middleware, Request, Response, requestHeaders, responseLBS, vault)
+import Network.Wai
+  ( Middleware,
+    Request,
+    Response,
+    ResponseReceived,
+    requestHeaders,
+    responseLBS,
+    vault,
+  )
 import System.IO.Unsafe (unsafePerformIO)
 
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
 
--- | The @\"Bearer \"@ prefix length (7 bytes).
-bearerPrefixLen :: Int
-bearerPrefixLen = 7
+-- | Media type of the plain-text bodies this middleware returns.
+textPlain :: BS.ByteString
+textPlain = "text/plain; charset=utf-8"
+
+-- | Response body when no bearer token was supplied at all.
+missingHeaderMessage :: LBS.ByteString
+missingHeaderMessage = "Missing or malformed Authorization header"
 
 -- ---------------------------------------------------------------------------
 -- Simple Middleware
@@ -62,14 +72,8 @@ bearerPrefixLen = 7
 -- main = run 3000 $ requireAuth cache cfg myApp
 -- @
 requireAuth :: KeyCache -> FirebaseConfig -> Middleware
-requireAuth cache cfg app req respond = do
-  case extractBearer req of
-    Nothing -> respond unauthorizedResponse
-    Just tok -> do
-      result <- verifyIdTokenCached cache cfg tok
-      case result of
-        Left err -> respond (errorResponse err)
-        Right _user -> app req respond
+requireAuth cache cfg app req respond =
+  withVerifiedUser cache cfg req respond (const (app req respond))
 
 -- ---------------------------------------------------------------------------
 -- Vault-based Middleware (advanced)
@@ -98,16 +102,9 @@ firebaseUserKey = unsafePerformIO Vault.newKey
 --   Nothing   -> ...  -- should not happen (middleware rejects first)
 -- @
 firebaseAuth :: KeyCache -> FirebaseConfig -> Middleware
-firebaseAuth cache cfg app req respond = do
-  case extractBearer req of
-    Nothing -> respond unauthorizedResponse
-    Just tok -> do
-      result <- verifyIdTokenCached cache cfg tok
-      case result of
-        Left err -> respond (errorResponse err)
-        Right user ->
-          let req' = req {vault = Vault.insert firebaseUserKey user (vault req)}
-           in app req' respond
+firebaseAuth cache cfg app req respond =
+  withVerifiedUser cache cfg req respond $ \user ->
+    app req {vault = Vault.insert firebaseUserKey user (vault req)} respond
 
 -- | Look up the authenticated 'FirebaseUser' from a WAI request vault.
 --
@@ -119,34 +116,25 @@ lookupFirebaseUser = Vault.lookup firebaseUserKey . vault
 -- Helpers
 -- ---------------------------------------------------------------------------
 
--- | Extract a Bearer token from a request's Authorization header.
-extractBearer :: Request -> Maybe BS.ByteString
-extractBearer req = do
-  hdr <- lookup "Authorization" (requestHeaders req)
-  if "Bearer " `BS.isPrefixOf` hdr
-    then Just (BS.drop bearerPrefixLen hdr)
-    else Nothing
+-- | Verify the request's bearer token, answering 401 on any failure and
+-- handing the authenticated user to the continuation otherwise.
+--
+-- Both middlewares share this, so they cannot drift apart on which requests
+-- they admit or what they say when they refuse.
+withVerifiedUser ::
+  KeyCache ->
+  FirebaseConfig ->
+  Request ->
+  (Response -> IO ResponseReceived) ->
+  (FirebaseUser -> IO ResponseReceived) ->
+  IO ResponseReceived
+withVerifiedUser cache cfg req respond onVerified =
+  case bearerToken (requestHeaders req) of
+    Nothing -> respond (unauthorized missingHeaderMessage)
+    Just token -> do
+      result <- verifyIdTokenCached cache cfg token
+      either (respond . unauthorized . authErrorMessage) onVerified result
 
--- | 401 response for missing or invalid tokens.
-unauthorizedResponse :: Response
-unauthorizedResponse =
-  responseLBS
-    status401
-    [("Content-Type", "text/plain")]
-    "Missing or malformed Authorization header"
-
--- | 401 response with a description of the auth error.
-errorResponse :: AuthError -> Response
-errorResponse err =
-  responseLBS
-    status401
-    [("Content-Type", "text/plain")]
-    (authErrorMessage err)
-
--- | Convert an 'AuthError' to a response message.
-authErrorMessage :: AuthError -> LBS8.ByteString
-authErrorMessage (KeyFetchError _) = "Authentication service unavailable"
-authErrorMessage InvalidSignature = "Invalid token signature"
-authErrorMessage TokenExpired = "Token expired"
-authErrorMessage (InvalidClaims _) = "Invalid token claims"
-authErrorMessage (MalformedToken _) = "Malformed token"
+-- | A 401 response carrying a plain-text explanation.
+unauthorized :: LBS.ByteString -> Response
+unauthorized = responseLBS status401 [(hContentType, textPlain)]

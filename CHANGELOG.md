@@ -1,10 +1,59 @@
 # Changelog
 
+## 0.3.0.0
+
+### Fixed
+- Percent-encode every caller-supplied URL component. Project IDs, collection
+  paths, document IDs, and `updateMask` field paths were interpolated raw, so
+  a value containing `?`, `#`, `%`, `&`, a space, or any non-ASCII character
+  produced a malformed request or injected query parameters. Subcollection
+  `/` separators are preserved; the segments between them are encoded.
+- A cache refresh no longer overwrites a newer key set installed by a
+  concurrent verification.
+
+### Breaking Changes
+- `KeyCache` is now backed by `IORef` rather than `TVar`, and `Firebase.Auth`
+  re-exports it as an abstract type. Construct it with `newKeyCache` or
+  `newTlsKeyCache`.
+- Dropped the `stm` dependency: the cache is a single reference with no
+  composed transactions, which `atomicModifyIORef'` covers.
+- Dropped the `mtl` dependency from the `servant` flag. `Firebase.Servant`
+  now builds its 401 on the `Handler` newtype and `transformers`, which does
+  not depend on which `MonadError` re-export a given servant version ships.
+- `Firebase.Servant` no longer exports `extractBearerToken` or
+  `authErrorToBody`. Both were duplicates of the `Firebase.Auth.WAI`
+  versions; use `Firebase.Auth.Internal.bearerToken` and
+  `Firebase.Auth.authErrorMessage`.
+- A response body that is JSON but not shaped like a Firestore error now
+  reports `NetworkError "HTTP <status>"` instead of
+  `FirestoreApiError status "" "unknown error"`.
+
+### Added
+- `mkUpdateWrite` and `mkDeleteWrite` build the writes `commitTransaction`
+  and `runTransaction` expect. `mkUpdateWrite` was referenced by the README
+  and Haddock but never existed, leaving no supported way to construct a
+  write.
+- `Firebase.Auth.Internal`: base64url padding and bearer-token extraction,
+  shared by the verifier and both web integrations.
+- `authErrorMessage` renders an `AuthError` as a client-safe body.
+- `documentResourceName` and the percent-encoding helpers are exported from
+  `Firebase.Firestore.Internal`.
+
+### Changed
+- Bearer scheme names are matched case-insensitively, as RFC 7235 requires.
+- Widened bounds: `http-client-tls < 0.5` (resolves the Stackage report in
+  issue #1), `containers < 0.9` (`< 0.8` excluded the version GHC 9.10 and
+  later ship, blocking those compilers outright), `aeson < 2.4`,
+  `time < 1.17`, `crypton < 2`. Lowered `base` to `>= 4.18`.
+- CI builds the `wai` and `servant` modules, which no job previously
+  compiled, and adds a GHC compatibility matrix, an sdist build, and an
+  ASCII-only source check.
+
 ## 0.2.0.0
 
 ### Breaking Changes
 - Replaced `jose` JWT backend with direct `crypton` RS256 verification
-- Dropped `jose`, `lens`, `memory` dependencies — significantly lighter dependency tree
+- Dropped `jose`, `lens`, `memory` dependencies for a significantly lighter dependency tree
 - `JWKSet` (from jose) replaced with internal `JwkSet`/`JwkKey` types in `Firebase.Auth.Types`
 - License changed from MIT to BSD-3-Clause
 

@@ -1,6 +1,3 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Firestore.Query
 -- Description : Structured query DSL for Firestore

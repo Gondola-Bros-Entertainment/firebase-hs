@@ -1,7 +1,3 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE StrictData #-}
-
 -- |
 -- Module      : Firebase.Auth
 -- Description : Firebase ID token verification
@@ -27,33 +23,46 @@ module Firebase.Auth
     verifyIdToken,
 
     -- * Cached verification
+    KeyCache,
     newKeyCache,
     newTlsKeyCache,
     verifyIdTokenCached,
 
+    -- * Configuration
+    FirebaseConfig (..),
+    defaultFirebaseConfig,
+
+    -- * Authenticated user
+    FirebaseUser (..),
+
+    -- * Errors
+    AuthError (..),
+    authErrorMessage,
+
     -- * Utilities
     parseCacheMaxAge,
-
-    -- * Re-exports
-    module Firebase.Auth.Types,
   )
 where
 
-import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (SomeException, try)
+import Control.Monad (guard)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.PubKey.RSA.PKCS15 (verify)
 import Crypto.PubKey.RSA.Types (PublicKey)
 import Data.Aeson (FromJSON (..), (.:), (.:?))
 import qualified Data.Aeson as Aeson
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64URL
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.List (find)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Firebase.Auth.Internal (padBase64Url)
 import Firebase.Auth.Types
 import Network.HTTP.Client
   ( Manager,
@@ -102,6 +111,13 @@ instance FromJSON JwtPayload where
       <*> o .:? "email"
       <*> o .:? "name"
 
+-- | The three dot-separated parts of a compact JWT, still base64url-encoded.
+data JwtParts = JwtParts
+  { jwtHeaderPart :: !BS.ByteString,
+    jwtPayloadPart :: !BS.ByteString,
+    jwtSignaturePart :: !BS.ByteString
+  }
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
@@ -110,6 +126,7 @@ googleJwkUrl :: String
 googleJwkUrl =
   "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
 
+-- | Cache lifetime assumed when Google's response carries no @max-age@.
 defaultCacheDurationSeconds :: NominalDiffTime
 defaultCacheDurationSeconds = 3600
 
@@ -118,6 +135,14 @@ firebaseIssuerPrefix = "https://securetoken.google.com/"
 
 expectedAlgorithm :: Text
 expectedAlgorithm = "RS256"
+
+-- | The @Cache-Control@ directive carrying a response's lifetime in seconds.
+maxAgeDirective :: BS.ByteString
+maxAgeDirective = "max-age="
+
+-- | The separator between the three parts of a compact JWT.
+jwtPartSeparator :: Char
+jwtPartSeparator = '.'
 
 -- ---------------------------------------------------------------------------
 -- One-shot verification
@@ -133,20 +158,21 @@ verifyIdToken ::
   BS.ByteString ->
   IO (Either AuthError FirebaseUser)
 verifyIdToken mgr config token = do
-  keysResult <- fetchGoogleKeys mgr
-  case keysResult of
-    Left err -> pure (Left err)
-    Right (jwks, _expiry) -> verifyWithKeys jwks config token
+  fetched <- fetchGoogleKeys mgr
+  either (pure . Left) (verifyWithKeys config token . fst) fetched
 
 -- ---------------------------------------------------------------------------
 -- Cached verification
 -- ---------------------------------------------------------------------------
 
 -- | Create a key cache backed by the given HTTP manager.
+--
+-- The cache starts empty and expired, so the first verification fetches
+-- Google's keys.
 newKeyCache :: Manager -> IO KeyCache
 newKeyCache mgr = do
   epoch <- getCurrentTime
-  ref <- newTVarIO (JwkSet [], epoch)
+  ref <- newIORef (JwkSet [], epoch)
   pure KeyCache {kcKeysRef = ref, kcManager = mgr}
 
 -- | Create a key cache with a fresh TLS-enabled HTTP manager.
@@ -163,21 +189,36 @@ verifyIdTokenCached ::
   BS.ByteString ->
   IO (Either AuthError FirebaseUser)
 verifyIdTokenCached cache config token = do
+  keys <- currentKeys cache
+  either (pure . Left) (verifyWithKeys config token) keys
+
+-- | The cached key set, refetching first if it has expired.
+currentKeys :: KeyCache -> IO (Either AuthError JwkSet)
+currentKeys cache = do
   now <- getCurrentTime
-  (jwks, expiry) <- readTVarIO (kcKeysRef cache)
-  keysResult <-
-    if now >= expiry
-      then do
-        result <- fetchGoogleKeys (kcManager cache)
-        case result of
-          Left err -> pure (Left err)
-          Right (newKeys, newExpiry) -> do
-            atomically $ writeTVar (kcKeysRef cache) (newKeys, newExpiry)
-            pure (Right newKeys)
-      else pure (Right jwks)
-  case keysResult of
-    Left err -> pure (Left err)
-    Right keys -> verifyWithKeys keys config token
+  (keys, expiry) <- readIORef (kcKeysRef cache)
+  if now < expiry
+    then pure (Right keys)
+    else refreshKeys cache
+
+-- | Fetch a fresh key set and install it in the cache.
+refreshKeys :: KeyCache -> IO (Either AuthError JwkSet)
+refreshKeys cache = do
+  fetched <- fetchGoogleKeys (kcManager cache)
+  traverse install fetched
+  where
+    install entry = do
+      atomicModifyIORef' (kcKeysRef cache) (\cached -> (laterExpiring cached entry, ()))
+      pure (fst entry)
+
+-- | Of two cache entries, the one that stays valid longer.
+--
+-- Concurrent verifications can each refresh on expiry; keeping the later
+-- expiry stops a slow response from displacing a newer key set.
+laterExpiring :: (JwkSet, UTCTime) -> (JwkSet, UTCTime) -> (JwkSet, UTCTime)
+laterExpiring cached fetched
+  | snd fetched > snd cached = fetched
+  | otherwise = cached
 
 -- ---------------------------------------------------------------------------
 -- Key fetching
@@ -186,88 +227,92 @@ verifyIdTokenCached cache config token = do
 fetchGoogleKeys :: Manager -> IO (Either AuthError (JwkSet, UTCTime))
 fetchGoogleKeys mgr = do
   req <- parseRequest googleJwkUrl
-  respResult <- try (httpLbs req mgr) :: IO (Either SomeException (Response LBS.ByteString))
-  case respResult of
+  fetched <- try (httpLbs req mgr) :: IO (Either SomeException (Response LBS.ByteString))
+  case fetched of
     Left err -> pure (Left (KeyFetchError (T.pack (show err))))
     Right resp -> do
       now <- getCurrentTime
-      let body = responseBody resp
-          maxAge = parseCacheMaxAge (responseHeaders resp)
-          duration = maybe defaultCacheDurationSeconds fromIntegral maxAge
-          expiry = addUTCTime duration now
-      case Aeson.eitherDecode body of
-        Left err -> pure (Left (KeyFetchError (T.pack err)))
-        Right jwks -> do
-          !_ <- evaluate jwks
-          pure (Right (jwks, expiry))
+      pure (fmap (,cacheExpiry now resp) (decodeKeys (responseBody resp)))
+
+-- | When a key response stops being usable, per its @Cache-Control@ header.
+cacheExpiry :: UTCTime -> Response LBS.ByteString -> UTCTime
+cacheExpiry now resp = addUTCTime duration now
+  where
+    duration =
+      maybe defaultCacheDurationSeconds fromIntegral $
+        parseCacheMaxAge (responseHeaders resp)
+
+decodeKeys :: LBS.ByteString -> Either AuthError JwkSet
+decodeKeys = first (KeyFetchError . T.pack) . Aeson.eitherDecode
 
 -- | Parse the @max-age@ directive from a @Cache-Control@ response header.
+--
+-- Yields 'Nothing' when the directive is absent, unparseable, or
+-- non-positive, leaving the caller to apply its own default.
 --
 -- >>> parseCacheMaxAge [("cache-control", "public, max-age=19845, must-revalidate")]
 -- Just 19845
 parseCacheMaxAge :: ResponseHeaders -> Maybe Int
 parseCacheMaxAge headers = do
-  cc <- lookup hCacheControl headers
-  let (_before, rest) = BS.breakSubstring "max-age=" cc
-  if BS.null rest
-    then Nothing
-    else do
-      let numPart = BS.drop maxAgePrefixLen rest
-      case BS8.readInt numPart of
-        Just (n, _) | n > 0 -> Just n
-        _ -> Nothing
-  where
-    maxAgePrefixLen :: Int
-    maxAgePrefixLen = 8
+  cacheControl <- lookup hCacheControl headers
+  let (_before, fromDirective) = BS.breakSubstring maxAgeDirective cacheControl
+  (seconds, _rest) <- BS8.readInt (BS.drop (BS.length maxAgeDirective) fromDirective)
+  seconds <$ guard (seconds > 0)
 
 -- ---------------------------------------------------------------------------
 -- JWT verification
 -- ---------------------------------------------------------------------------
 
+-- | Verify a token against a key set. Reads the clock, then decides purely.
 verifyWithKeys ::
-  JwkSet ->
   FirebaseConfig ->
   BS.ByteString ->
+  JwkSet ->
   IO (Either AuthError FirebaseUser)
-verifyWithKeys jwks config tokenBytes = do
+verifyWithKeys config tokenBytes jwks = do
   now <- getCurrentTime
-  pure $ do
-    (headerB64, payloadB64, sigBytes, header, payload) <- parseCompactJwt tokenBytes
-    validateAlgorithm header
-    pubKey <- findKeyByKid (jhKid header) jwks
-    verifySignature pubKey (headerB64 <> "." <> payloadB64) sigBytes
-    validateClaims config now payload
-    extractUser payload
+  pure (validateToken config now jwks tokenBytes)
+
+validateToken ::
+  FirebaseConfig ->
+  UTCTime ->
+  JwkSet ->
+  BS.ByteString ->
+  Either AuthError FirebaseUser
+validateToken config now jwks tokenBytes = do
+  parts <- splitCompactJwt tokenBytes
+  header <- decodeSegment "header" (jwtHeaderPart parts) >>= decodeJson "header"
+  payload <- decodeSegment "payload" (jwtPayloadPart parts) >>= decodeJson "payload"
+  signature <- decodeSegment "signature" (jwtSignaturePart parts)
+  validateAlgorithm header
+  pubKey <- findKeyByKid (jhKid header) jwks
+  verifySignature pubKey (signedData parts) signature
+  validateClaims config now payload
+  extractUser payload
+
+-- | The bytes a JWT signature covers: the header and payload, as sent.
+signedData :: JwtParts -> BS.ByteString
+signedData parts =
+  jwtHeaderPart parts <> BS8.singleton jwtPartSeparator <> jwtPayloadPart parts
 
 -- ---------------------------------------------------------------------------
 -- JWT parsing
 -- ---------------------------------------------------------------------------
 
-parseCompactJwt ::
-  BS.ByteString ->
-  Either AuthError (BS.ByteString, BS.ByteString, BS.ByteString, JwtHeader, JwtPayload)
-parseCompactJwt token =
-  case BS8.split '.' token of
-    [headerB64, payloadB64, sigB64] -> do
-      headerBytes <- decodeSegment "header" headerB64
-      payloadBytes <- decodeSegment "payload" payloadB64
-      sigBytes <- decodeSegment "signature" sigB64
-      header <- decodeJson "header" headerBytes
-      payload <- decodeJson "payload" payloadBytes
-      Right (headerB64, payloadB64, sigBytes, header, payload)
+splitCompactJwt :: BS.ByteString -> Either AuthError JwtParts
+splitCompactJwt token =
+  case BS8.split jwtPartSeparator token of
+    [header, payload, signature] -> Right (JwtParts header payload signature)
     _ -> Left (MalformedToken "expected 3 dot-separated parts")
 
 decodeSegment :: Text -> BS.ByteString -> Either AuthError BS.ByteString
-decodeSegment label input =
-  case B64URL.decode (padBase64Url input) of
-    Left err -> Left (MalformedToken (label <> ": " <> T.pack err))
-    Right bs -> Right bs
+decodeSegment label = first (malformed label) . B64URL.decode . padBase64Url
 
 decodeJson :: (FromJSON a) => Text -> BS.ByteString -> Either AuthError a
-decodeJson label bytes =
-  case Aeson.eitherDecodeStrict bytes of
-    Left err -> Left (MalformedToken (label <> ": " <> T.pack err))
-    Right val -> Right val
+decodeJson label = first (malformed label) . Aeson.eitherDecodeStrict
+
+malformed :: Text -> String -> AuthError
+malformed label detail = MalformedToken (label <> ": " <> T.pack detail)
 
 -- ---------------------------------------------------------------------------
 -- Signature verification
@@ -280,13 +325,11 @@ validateAlgorithm header
 
 findKeyByKid :: Text -> JwkSet -> Either AuthError PublicKey
 findKeyByKid kid (JwkSet keys) =
-  case filter (\k -> jkKid k == kid) keys of
-    (matched : _) -> Right (jkKey matched)
-    [] -> Left InvalidSignature
+  maybe (Left InvalidSignature) (Right . jkKey) (find ((== kid) . jkKid) keys)
 
 verifySignature :: PublicKey -> BS.ByteString -> BS.ByteString -> Either AuthError ()
-verifySignature pubKey signedData sigBytes
-  | verify (Just SHA256) pubKey signedData sigBytes = Right ()
+verifySignature pubKey payload signature
+  | verify (Just SHA256) pubKey payload signature = Right ()
   | otherwise = Left InvalidSignature
 
 -- ---------------------------------------------------------------------------
@@ -295,13 +338,14 @@ verifySignature pubKey signedData sigBytes
 
 validateClaims :: FirebaseConfig -> UTCTime -> JwtPayload -> Either AuthError ()
 validateClaims config now payload = do
-  let projectId = fcProjectId config
-      expectedIssuer = firebaseIssuerPrefix <> projectId
-      skew = fcClockSkew config
   requireClaim "iss" (jpIss payload) (== expectedIssuer) (InvalidClaims "issuer mismatch")
   requireClaim "aud" (jpAud payload) (== projectId) (InvalidClaims "audience mismatch")
   requireExpiry skew now (jpExp payload)
   requireIssuedAt skew now (jpIat payload)
+  where
+    projectId = fcProjectId config
+    expectedIssuer = firebaseIssuerPrefix <> projectId
+    skew = fcClockSkew config
 
 requireClaim :: Text -> Maybe Text -> (Text -> Bool) -> AuthError -> Either AuthError ()
 requireClaim label mVal predicate err =
@@ -313,18 +357,14 @@ requireClaim label mVal predicate err =
 requireExpiry :: NominalDiffTime -> UTCTime -> Maybe Integer -> Either AuthError ()
 requireExpiry _skew _now Nothing = Left (InvalidClaims "missing exp claim")
 requireExpiry skew now (Just expSeconds)
-  | addUTCTime skew expTime >= now = Right ()
+  | addUTCTime skew (posixSecondsToUTCTime (fromInteger expSeconds)) >= now = Right ()
   | otherwise = Left TokenExpired
-  where
-    expTime = posixSecondsToUTCTime (fromInteger expSeconds)
 
 requireIssuedAt :: NominalDiffTime -> UTCTime -> Maybe Integer -> Either AuthError ()
 requireIssuedAt _skew _now Nothing = Left (InvalidClaims "missing iat claim")
 requireIssuedAt skew now (Just iatSeconds)
-  | diffUTCTime iatTime now <= skew = Right ()
+  | diffUTCTime (posixSecondsToUTCTime (fromInteger iatSeconds)) now <= skew = Right ()
   | otherwise = Left (InvalidClaims "token issued in the future")
-  where
-    iatTime = posixSecondsToUTCTime (fromInteger iatSeconds)
 
 -- ---------------------------------------------------------------------------
 -- User extraction
@@ -333,8 +373,13 @@ requireIssuedAt skew now (Just iatSeconds)
 extractUser :: JwtPayload -> Either AuthError FirebaseUser
 extractUser payload =
   case jpSub payload of
-    Just sub
-      | not (T.null sub) ->
-          Right FirebaseUser {fuUid = sub, fuEmail = jpEmail payload, fuName = jpName payload}
-    Just _ -> Left (InvalidClaims "empty sub claim")
     Nothing -> Left (InvalidClaims "missing sub claim")
+    Just sub
+      | T.null sub -> Left (InvalidClaims "empty sub claim")
+      | otherwise ->
+          Right
+            FirebaseUser
+              { fuUid = sub,
+                fuEmail = jpEmail payload,
+                fuName = jpName payload
+              }

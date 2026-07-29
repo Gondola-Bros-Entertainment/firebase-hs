@@ -2,7 +2,7 @@
 <h1>firebase-hs</h1>
 <p><strong>Firebase for Haskell</strong></p>
 <p>Auth verification, Firestore CRUD, structured queries, atomic transactions, and a Servant auth combinator.</p>
-<p><a href="#quick-start">Quick Start</a> · <a href="#firestore">Firestore</a> · <a href="#servant">Servant</a> · <a href="#api-reference">API Reference</a></p>
+<p><a href="#quick-start">Quick Start</a> | <a href="#firestore">Firestore</a> | <a href="#servant">Servant</a> | <a href="#api-reference">API Reference</a></p>
 <p>
 
 [![CI](https://github.com/Gondola-Bros-Entertainment/firebase-hs/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/firebase-hs/actions/workflows/ci.yml)
@@ -19,9 +19,9 @@
 
 A pure Haskell library for Firebase services:
 
-- **Auth** — JWT verification against Google's public JWKs using crypton for RS256, with automatic key caching
-- **Firestore** — CRUD operations, structured queries, and atomic transactions via the REST API
-- **Servant** — One-liner auth combinator for Servant servers (optional flag)
+- **Auth**: JWT verification against Google's public JWKs using crypton for RS256, with automatic key caching
+- **Firestore**: CRUD operations, structured queries, and atomic transactions via the REST API
+- **WAI / Servant**: auth middleware and a one-line auth combinator, each behind an optional flag
 
 ---
 
@@ -66,7 +66,9 @@ main = do
 
 ### Key Caching
 
-Keys are fetched lazily on first verification, cached per Google's `Cache-Control: max-age`, and refreshed automatically. Thread-safe via STM.
+Keys are fetched lazily on first verification, cached for the lifetime named
+by Google's `Cache-Control: max-age`, and refreshed automatically when that
+expires. Build one `KeyCache` at startup and share it across threads.
 
 ### Error Handling
 
@@ -80,6 +82,9 @@ case result of
   Right user               -> handleAuthenticated user
 ```
 
+The `Text` payloads describe internal specifics. To render an error for a
+client instead, use `authErrorMessage`, which omits them.
+
 ---
 
 ## Firestore
@@ -87,6 +92,7 @@ case result of
 ### CRUD Operations
 
 ```haskell
+import qualified Data.Map.Strict as Map
 import Firebase.Firestore
 
 main :: IO ()
@@ -139,25 +145,33 @@ let q = query (CollectionPath "users")
 
 ### Atomic Transactions
 
-Read-then-write operations that succeed or fail atomically:
+Read-then-write operations that succeed or fail together. If the callback
+fails, or the commit does, the transaction is rolled back for you:
 
 ```haskell
-result <- runTransaction mgr tok pid ReadWrite $ \txnId -> runExceptT $ do
+result <- runTransaction mgr tok pid ReadWrite $ \_txnId -> runExceptT $ do
   -- Reads within the transaction see a consistent snapshot
-  d <- ExceptT $ getDocument mgr tok pid userPath
-  let newBalance = computeNewBalance (docFields d)
-  pure [mkUpdateWrite userPath newBalance]
+  doc <- ExceptT $ getDocument mgr tok pid userPath
+  let updated = applyDebit 100 (docFields doc)
+  pure [mkUpdateWrite pid userPath updated]
 ```
 
-Retry aborted transactions:
+Use `mkUpdateWrite` and `mkDeleteWrite` to build the writes a commit expects.
+
+Losing a contention race returns `TransactionAborted`. Retry with the aborted
+transaction's ID to give the new attempt priority:
 
 ```haskell
--- First attempt
-result <- beginTransaction mgr tok pid ReadWrite
-case result of
-  Left (TransactionAborted _) ->
-    -- Retry with the failed transaction ID for priority
-    beginTransaction mgr tok pid (RetryWith txnId)
+begun <- beginTransaction mgr tok pid ReadWrite
+case begun of
+  Left err -> pure (Left err)
+  Right txnId -> do
+    committed <- commitTransaction mgr tok pid txnId writes
+    case committed of
+      Left (TransactionAborted _) -> do
+        retried <- beginTransaction mgr tok pid (RetryWith txnId)
+        either (pure . Left) (\rid -> commitTransaction mgr tok pid rid writes) retried
+      other -> pure other
 ```
 
 ### Firestore Value Types
@@ -171,13 +185,15 @@ data FirestoreValue
   | ArrayValue ![FirestoreValue] | MapValue !(Map Text FirestoreValue)
 ```
 
-Note: integers are encoded as JSON strings (`{"integerValue":"42"}`), not numbers. The JSON instances handle this transparently.
+Note: integers are encoded as JSON strings (`{"integerValue":"42"}`), not
+numbers. The JSON instances handle this transparently.
 
 ---
 
 ## WAI Middleware
 
-Protect any WAI-based server (Warp, Scotty, Yesod, Spock) with Firebase auth. Enable with the `wai` cabal flag:
+Protect any WAI-based server (Warp, Scotty, Yesod, Spock) with Firebase auth.
+Enable with the `wai` cabal flag:
 
 ```bash
 cabal build -f wai
@@ -204,13 +220,21 @@ main = do
 Store the authenticated user in the WAI vault for downstream handlers:
 
 ```haskell
+import qualified Data.ByteString.Lazy.Char8 as LBS8
+import qualified Data.Text as T
 import Firebase.Auth.WAI (firebaseAuth, lookupFirebaseUser)
+import Network.HTTP.Types (status200, status500)
+import Network.Wai (responseLBS)
 
-main = run 3000 $ firebaseAuth cache cfg myApp
+main :: IO ()
+main = do
+  cache <- newTlsKeyCache
+  let cfg = defaultFirebaseConfig "my-project-id"
+  run 3000 (firebaseAuth cache cfg myApp)
 
-myHandler req respond = case lookupFirebaseUser req of
-  Just user -> respond (ok200 ("Hello, " <> fuUid user))
-  Nothing   -> respond (err500 "unreachable")
+myApp req respond = respond $ case lookupFirebaseUser req of
+  Just user -> responseLBS status200 [] (LBS8.pack ("Hello, " <> T.unpack (fuUid user)))
+  Nothing   -> responseLBS status500 [] "unreachable: the middleware rejects first"
 ```
 
 ---
@@ -223,7 +247,7 @@ Enable with the `servant` cabal flag:
 cabal build -f servant
 ```
 
-One-liner auth for any Servant server:
+One-line auth for any Servant server:
 
 ```haskell
 import Firebase.Auth (newTlsKeyCache, defaultFirebaseConfig)
@@ -238,7 +262,8 @@ main = do
   runSettings defaultSettings (serveWithContext api ctx server)
 ```
 
-The handler extracts the Bearer token, verifies it against Google's keys, and injects a `FirebaseUser` into your endpoint — or returns 401 with a descriptive error.
+The handler extracts the Bearer token, verifies it against Google's keys, and
+injects a `FirebaseUser` into your endpoint, or returns 401.
 
 ---
 
@@ -251,6 +276,7 @@ verifyIdToken       :: Manager -> FirebaseConfig -> ByteString -> IO (Either Aut
 newKeyCache         :: Manager -> IO KeyCache
 newTlsKeyCache      :: IO KeyCache
 verifyIdTokenCached :: KeyCache -> FirebaseConfig -> ByteString -> IO (Either AuthError FirebaseUser)
+authErrorMessage    :: AuthError -> LBS.ByteString
 parseCacheMaxAge    :: ResponseHeaders -> Maybe Int
 ```
 
@@ -271,6 +297,8 @@ beginTransaction    :: Manager -> AccessToken -> ProjectId -> TransactionMode ->
 commitTransaction   :: Manager -> AccessToken -> ProjectId -> TransactionId -> [Value] -> IO (Either FirestoreError ())
 rollbackTransaction :: Manager -> AccessToken -> ProjectId -> TransactionId -> IO (Either FirestoreError ())
 runTransaction      :: Manager -> AccessToken -> ProjectId -> TransactionMode -> (TransactionId -> IO (Either FirestoreError [Value])) -> IO (Either FirestoreError ())
+mkUpdateWrite       :: ProjectId -> DocumentPath -> Map Text FirestoreValue -> Value
+mkDeleteWrite       :: ProjectId -> DocumentPath -> Value
 ```
 
 ### WAI Middleware
@@ -285,8 +313,6 @@ lookupFirebaseUser :: Request -> Maybe FirebaseUser
 
 ```haskell
 firebaseAuthHandler :: KeyCache -> FirebaseConfig -> AuthHandler Request FirebaseUser
-extractBearerToken  :: Request -> Maybe ByteString
-authErrorToBody     :: AuthError -> LBS.ByteString
 ```
 
 Full Haddock documentation is available on [Hackage](https://hackage.haskell.org/package/firebase-hs).
@@ -296,16 +322,20 @@ Full Haddock documentation is available on [Hackage](https://hackage.haskell.org
 ## Build & Test
 
 ```bash
-cabal build                              # Build library
-cabal test                               # Run all tests (46 pure tests)
-cabal build --ghc-options="-Werror"      # Warnings as errors
-cabal build -f wai                       # Build with WAI middleware
-cabal build -f servant                   # Build with Servant combinator
-cabal haddock                            # Generate docs
+cabal build                       # Library, default flags
+cabal test                        # Test suite
+cabal haddock -f wai -f servant   # Generate docs
+```
+
+The optional modules are off by default. To build everything the package
+ships, with warnings as errors:
+
+```bash
+cabal build all -f wai -f servant --enable-tests --ghc-options="-Werror"
 ```
 
 ---
 
 <p align="center">
-  <sub>BSD-3-Clause License · <a href="https://github.com/Gondola-Bros-Entertainment">Gondola Bros Entertainment</a></sub>
+  <sub>BSD-3-Clause License | <a href="https://github.com/Gondola-Bros-Entertainment">Gondola Bros Entertainment</a></sub>
 </p>
