@@ -8,10 +8,21 @@
   a value containing `?`, `#`, `%`, `&`, a space, or any non-ASCII character
   produced a malformed request or injected query parameters. Subcollection
   `/` separators are preserved; the segments between them are encoded.
+- `FirestoreValue` covers every type Firestore stores. `bytesValue`,
+  `referenceValue`, and `geoPointValue` had no representation, so a document
+  containing any of them failed to decode outright and `getDocument` returned
+  `InvalidResponse` for data Firestore considers perfectly valid.
 - A cache refresh no longer overwrites a newer key set installed by a
   concurrent verification.
 
 ### Breaking Changes
+- Firestore operations take a single `Firestore` handle in place of the
+  `Manager -> AccessToken -> ProjectId` prefix every one of them repeated.
+  Build it with `newFirestore`, and refresh an expiring token with
+  `withToken` rather than rebuilding the connection pool.
+- `FirebaseUser` gained fields, so positional construction no longer
+  compiles. Pattern matches on `fuUid`, `fuEmail`, and `fuName` are
+  unaffected.
 - `KeyCache` is now backed by `IORef` rather than `TVar`, and `Firebase.Auth`
   re-exports it as an abstract type. Construct it with `newKeyCache` or
   `newTlsKeyCache`.
@@ -29,6 +40,14 @@
   `FirestoreApiError status "" "unknown error"`.
 
 ### Added
+- Token claims are no longer discarded. `FirebaseUser` now carries
+  `fuEmailVerified`, `fuPicture`, `fuAuthTime`, `fuSignInProvider`, and
+  `fuCustomClaims`, with `hasClaim` and `lookupClaim` to read them. Custom
+  claims are how Firebase expresses roles, so without them a verified token
+  could establish identity but not authorize anything.
+- `listDocuments` lists a collection. `collectionUrl` had described itself as
+  "used for listing" since the first release with nothing to use it.
+- `BytesValue`, `ReferenceValue`, `GeoPointValue`, and the `GeoPoint` type.
 - `mkUpdateWrite` and `mkDeleteWrite` build the writes `commitTransaction`
   and `runTransaction` expect. `mkUpdateWrite` was referenced by the README
   and Haddock but never existed, leaving no supported way to construct a

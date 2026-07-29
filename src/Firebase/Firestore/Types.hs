@@ -14,8 +14,12 @@ module Firebase.Firestore.Types
     AccessToken (..),
     DocumentPath (..),
 
+    -- * Handle
+    Firestore (..),
+
     -- * Values
     FirestoreValue (..),
+    GeoPoint (..),
 
     -- * Documents
     Document (..),
@@ -30,20 +34,23 @@ module Firebase.Firestore.Types
   )
 where
 
-import Data.Aeson (FromJSON (..), ToJSON (..), (.:), (.:?), (.=))
+import Data.Aeson (FromJSON (..), ToJSON (..), (.!=), (.:), (.:?), (.=))
 import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64 as B64
 import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import qualified Data.Text.Read as TR
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM)
+import Network.HTTP.Client (Manager)
 
 -- ---------------------------------------------------------------------------
 -- Identifiers
@@ -75,6 +82,25 @@ data DocumentPath = DocumentPath
     dpDocument :: !DocumentId
   }
   deriving (Eq, Show)
+
+-- ---------------------------------------------------------------------------
+-- Handle
+-- ---------------------------------------------------------------------------
+
+-- | Everything a Firestore operation needs: a connection pool, the project
+-- to address, and the credentials to present.
+--
+-- Build one with 'Firebase.Firestore.newFirestore' and pass it to every
+-- call. Access tokens expire, so refresh one with
+-- 'Firebase.Firestore.withToken' rather than rebuilding the manager.
+data Firestore = Firestore
+  { -- | Connection manager, reused across requests.
+    fsManager :: !Manager,
+    -- | Project every path is resolved against.
+    fsProject :: !ProjectId,
+    -- | OAuth2 credentials presented on each request.
+    fsToken :: !AccessToken
+  }
 
 -- ---------------------------------------------------------------------------
 -- Transactions
@@ -117,16 +143,42 @@ encodeTransactionOptions ReadOnly =
 -- Firestore values
 -- ---------------------------------------------------------------------------
 
+-- | A geographic point, as carried by Firestore's @geoPointValue@.
+data GeoPoint = GeoPoint
+  { gpLatitude :: !Double,
+    gpLongitude :: !Double
+  }
+  deriving (Eq, Show)
+
+instance ToJSON GeoPoint where
+  toJSON gp =
+    Aeson.object
+      [ "latitude" .= gpLatitude gp,
+        "longitude" .= gpLongitude gp
+      ]
+
+instance FromJSON GeoPoint where
+  parseJSON = Aeson.withObject "geoPointValue" $ \o ->
+    -- Firestore omits a coordinate that is exactly zero.
+    GeoPoint <$> o .:? "latitude" .!= 0 <*> o .:? "longitude" .!= 0
+
 -- | A Firestore value, mirroring the tagged JSON wire format.
 --
--- Integers are transmitted as JSON strings (e.g. @{\"integerValue\":\"42\"}@),
--- not as JSON numbers. The 'FromJSON' \/ 'ToJSON' instances handle this.
+-- Covers every type Firestore stores. Integers are transmitted as JSON
+-- strings (e.g. @{\"integerValue\":\"42\"}@) and bytes as base64; the
+-- 'FromJSON' \/ 'ToJSON' instances handle both.
 data FirestoreValue
   = NullValue
   | BoolValue !Bool
   | IntegerValue !Int64
   | DoubleValue !Double
   | StringValue !Text
+  | -- | Raw bytes, transmitted base64-encoded.
+    BytesValue !BS.ByteString
+  | -- | Full resource name of another document, as built by
+    -- 'Firebase.Firestore.Internal.documentResourceName'.
+    ReferenceValue !Text
+  | GeoPointValue !GeoPoint
   | TimestampValue !UTCTime
   | ArrayValue ![FirestoreValue]
   | MapValue !(Map Text FirestoreValue)
@@ -142,6 +194,9 @@ instance ToJSON FirestoreValue where
   toJSON (IntegerValue n) = Aeson.object ["integerValue" .= show n]
   toJSON (DoubleValue d) = Aeson.object ["doubleValue" .= d]
   toJSON (StringValue s) = Aeson.object ["stringValue" .= s]
+  toJSON (BytesValue bs) = Aeson.object ["bytesValue" .= TE.decodeUtf8 (B64.encode bs)]
+  toJSON (ReferenceValue name) = Aeson.object ["referenceValue" .= name]
+  toJSON (GeoPointValue gp) = Aeson.object ["geoPointValue" .= gp]
   toJSON (TimestampValue t) =
     Aeson.object
       ["timestampValue" .= formatTime defaultTimeLocale timestampFormat t]
@@ -159,10 +214,18 @@ instance FromJSON FirestoreValue where
       [("integerValue", v)] -> IntegerValue <$> parseIntegerValue v
       [("doubleValue", v)] -> DoubleValue <$> parseJSON v
       [("stringValue", v)] -> StringValue <$> parseJSON v
+      [("bytesValue", v)] -> BytesValue <$> parseBytesValue v
+      [("referenceValue", v)] -> ReferenceValue <$> parseJSON v
+      [("geoPointValue", v)] -> GeoPointValue <$> parseJSON v
       [("timestampValue", v)] -> TimestampValue <$> parseTimestamp v
       [("arrayValue", v)] -> ArrayValue <$> parseArrayValue v
       [("mapValue", v)] -> MapValue <$> parseMapValue v
-      _ -> fail "unrecognized FirestoreValue tag"
+      tagged -> fail ("unrecognized FirestoreValue tag: " ++ show (map fst tagged))
+
+-- | Parse a bytes value from its base64 representation.
+parseBytesValue :: Aeson.Value -> Parser BS.ByteString
+parseBytesValue = Aeson.withText "bytesValue" $ \t ->
+  either (fail . ("invalid bytesValue: " ++)) pure (B64.decode (TE.encodeUtf8 t))
 
 -- | Parse an integer value from a JSON string (Firestore's wire format).
 -- Uses decimal-only parsing: hex, octal, and other Haskell literals are

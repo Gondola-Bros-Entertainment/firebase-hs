@@ -64,6 +64,27 @@ main = do
 | **Issued at** | `iat` must be in the past (within clock skew) |
 | **Subject** | `sub` must be non-empty (becomes the Firebase UID) |
 
+### Authorization
+
+A verified token carries more than an identity. Custom claims set by the
+Firebase Admin SDK's `setCustomUserClaims` are where roles live:
+
+```haskell
+Right user <- verifyIdTokenCached cache cfg tokenBytes
+
+if hasClaim "admin" user
+  then handleAdmin user
+  else refuse
+
+-- Non-boolean claims come back as raw JSON
+case lookupClaim "tier" user of
+  Just (String tier) -> applyTier tier
+  _                  -> applyDefaultTier
+```
+
+`FirebaseUser` also exposes `fuEmailVerified`, `fuSignInProvider`, and
+`fuAuthTime` for requiring a recent login before a sensitive action.
+
 ### Key Caching
 
 Keys are fetched lazily on first verification, cached for the lifetime named
@@ -97,26 +118,30 @@ import Firebase.Firestore
 
 main :: IO ()
 main = do
-  mgr <- newTlsManager
-  let pid = ProjectId "my-project"
-      tok = AccessToken "ya29..."
+  fs <- newFirestore (ProjectId "my-project") (AccessToken "ya29...")
 
   -- Create
   let fields = Map.fromList [("name", StringValue "Alice"), ("age", IntegerValue 30)]
-  _ <- createDocument mgr tok pid (CollectionPath "users") (DocumentId "alice") fields
+  _ <- createDocument fs (CollectionPath "users") (DocumentId "alice") fields
 
   -- Read
   let path = DocumentPath (CollectionPath "users") (DocumentId "alice")
-  doc <- getDocument mgr tok pid path
+  doc <- getDocument fs path
 
   -- Update specific fields
-  let updates = Map.fromList [("age", IntegerValue 31)]
-  _ <- updateDocument mgr tok pid path ["age"] updates
+  _ <- updateDocument fs path ["age"] (Map.fromList [("age", IntegerValue 31)])
+
+  -- List a collection
+  docs <- listDocuments fs (CollectionPath "users")
 
   -- Delete
-  _ <- deleteDocument mgr tok pid path
+  _ <- deleteDocument fs path
   pure ()
 ```
+
+Build one `Firestore` and share it; it holds a pooled connection manager.
+Access tokens expire, so swap in a fresh one with `withToken fs` rather than
+rebuilding the handle.
 
 ### Structured Queries
 
@@ -130,7 +155,7 @@ let q = query (CollectionPath "users")
       & orderBy "age" Ascending
       & limit 10
 
-result <- runQuery mgr tok pid q
+result <- runQuery fs q
 ```
 
 Composite filters for complex conditions:
@@ -149,11 +174,11 @@ Read-then-write operations that succeed or fail together. If the callback
 fails, or the commit does, the transaction is rolled back for you:
 
 ```haskell
-result <- runTransaction mgr tok pid ReadWrite $ \_txnId -> runExceptT $ do
+result <- runTransaction fs ReadWrite $ \_txnId -> runExceptT $ do
   -- Reads within the transaction see a consistent snapshot
-  doc <- ExceptT $ getDocument mgr tok pid userPath
+  doc <- ExceptT $ getDocument fs userPath
   let updated = applyDebit 100 (docFields doc)
-  pure [mkUpdateWrite pid userPath updated]
+  pure [mkUpdateWrite (fsProject fs) userPath updated]
 ```
 
 Use `mkUpdateWrite` and `mkDeleteWrite` to build the writes a commit expects.
@@ -162,15 +187,15 @@ Losing a contention race returns `TransactionAborted`. Retry with the aborted
 transaction's ID to give the new attempt priority:
 
 ```haskell
-begun <- beginTransaction mgr tok pid ReadWrite
+begun <- beginTransaction fs ReadWrite
 case begun of
   Left err -> pure (Left err)
   Right txnId -> do
-    committed <- commitTransaction mgr tok pid txnId writes
+    committed <- commitTransaction fs txnId writes
     case committed of
       Left (TransactionAborted _) -> do
-        retried <- beginTransaction mgr tok pid (RetryWith txnId)
-        either (pure . Left) (\rid -> commitTransaction mgr tok pid rid writes) retried
+        retried <- beginTransaction fs (RetryWith txnId)
+        either (pure . Left) (\rid -> commitTransaction fs rid writes) retried
       other -> pure other
 ```
 
@@ -181,12 +206,14 @@ Values mirror Firestore's tagged wire format:
 ```haskell
 data FirestoreValue
   = NullValue | BoolValue !Bool | IntegerValue !Int64
-  | DoubleValue !Double | StringValue !Text | TimestampValue !UTCTime
+  | DoubleValue !Double | StringValue !Text | BytesValue !ByteString
+  | ReferenceValue !Text | GeoPointValue !GeoPoint | TimestampValue !UTCTime
   | ArrayValue ![FirestoreValue] | MapValue !(Map Text FirestoreValue)
 ```
 
-Note: integers are encoded as JSON strings (`{"integerValue":"42"}`), not
-numbers. The JSON instances handle this transparently.
+Every type Firestore stores is covered. Integers travel as JSON strings
+(`{"integerValue":"42"}`) and bytes as base64; the JSON instances handle both
+transparently.
 
 ---
 

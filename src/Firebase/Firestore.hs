@@ -8,25 +8,31 @@
 -- no exceptions are thrown for API-level errors.
 --
 -- @
+-- import qualified Data.Map.Strict as Map
 -- import Firebase.Firestore
 --
 -- main :: IO ()
 -- main = do
---   mgr <- newTlsManager
---   let pid = ProjectId \"my-project\"
---       tok = AccessToken \"ya29...\"
---       path = DocumentPath (CollectionPath \"users\") (DocumentId \"alice\")
---   result <- getDocument mgr tok pid path
+--   fs <- newFirestore (ProjectId \"my-project\") (AccessToken \"ya29...\")
+--   let path = DocumentPath (CollectionPath \"users\") (DocumentId \"alice\")
+--   result <- getDocument fs path
 --   case result of
 --     Left err  -> print err
 --     Right doc -> print (docFields doc)
 -- @
 module Firebase.Firestore
-  ( -- * CRUD Operations
+  ( -- * Handle
+    newFirestore,
+    withToken,
+
+    -- * CRUD Operations
     getDocument,
     createDocument,
     updateDocument,
     deleteDocument,
+
+    -- * Listing
+    listDocuments,
 
     -- * Queries
     runQuery,
@@ -67,8 +73,7 @@ import Firebase.Firestore.Internal
 import Firebase.Firestore.Query
 import Firebase.Firestore.Types
 import Network.HTTP.Client
-  ( Manager,
-    Request,
+  ( Request,
     RequestBody (..),
     Response,
     httpLbs,
@@ -99,71 +104,84 @@ applicationJson :: BS.ByteString
 applicationJson = "application/json"
 
 -- ---------------------------------------------------------------------------
+-- Handle
+-- ---------------------------------------------------------------------------
+
+-- | Build a t'Firestore' handle with a fresh TLS-enabled HTTP manager.
+--
+-- Build one and share it: the manager pools connections, so a handle per
+-- request throws that away.
+newFirestore :: ProjectId -> AccessToken -> IO Firestore
+newFirestore pid tok = do
+  mgr <- newTlsManager
+  pure Firestore {fsManager = mgr, fsProject = pid, fsToken = tok}
+
+-- | Replace the access token, keeping the manager and project.
+--
+-- OAuth2 tokens expire; swap in a fresh one rather than rebuilding the
+-- handle and discarding the connection pool with it.
+withToken :: AccessToken -> Firestore -> Firestore
+withToken tok fs = fs {fsToken = tok}
+
+-- ---------------------------------------------------------------------------
 -- CRUD Operations
 -- ---------------------------------------------------------------------------
 
 -- | Fetch a single document by path.
-getDocument ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  DocumentPath ->
-  IO (Either FirestoreError Document)
-getDocument mgr tok pid dp =
-  fmap (>>= decodeBody) (doGet mgr tok (documentUrl pid dp))
+getDocument :: Firestore -> DocumentPath -> IO (Either FirestoreError Document)
+getDocument fs dp =
+  fmap (>>= decodeBody) (doGet fs (documentUrl (fsProject fs) dp))
 
 -- | Create a document with a specific ID in a collection.
 createDocument ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
+  Firestore ->
   CollectionPath ->
   DocumentId ->
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
-createDocument mgr tok pid cp did fields =
-  fmap (>>= decodeBody) (doPost mgr tok (createDocUrl pid cp did) (encodeFields fields))
+createDocument fs cp did fields =
+  fmap (>>= decodeBody) (doPost fs (createDocUrl (fsProject fs) cp did) (encodeFields fields))
 
 -- | Update a document's fields. Pass field names to update specific fields,
 -- or an empty list to replace all fields.
 updateDocument ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
+  Firestore ->
   DocumentPath ->
   [Text] ->
   Map Text FirestoreValue ->
   IO (Either FirestoreError Document)
-updateDocument mgr tok pid dp fieldPaths fields =
-  fmap (>>= decodeBody) (doPatch mgr tok (updateDocUrl pid dp fieldPaths) (encodeFields fields))
+updateDocument fs dp fieldPaths fields =
+  fmap (>>= decodeBody) (doPatch fs (updateDocUrl (fsProject fs) dp fieldPaths) (encodeFields fields))
 
 -- | Delete a document by path.
-deleteDocument ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  DocumentPath ->
-  IO (Either FirestoreError ())
-deleteDocument mgr tok pid dp =
-  fmap void (doRequest mgr tok (documentUrl pid dp) methodDelete Nothing)
+deleteDocument :: Firestore -> DocumentPath -> IO (Either FirestoreError ())
+deleteDocument fs dp =
+  fmap void (doRequest fs (documentUrl (fsProject fs) dp) methodDelete Nothing)
 
 -- | Encode a field map as a Firestore write body.
 encodeFields :: Map Text FirestoreValue -> LBS.ByteString
 encodeFields fields = Aeson.encode (Aeson.object ["fields" .= fields])
 
 -- ---------------------------------------------------------------------------
+-- Listing
+-- ---------------------------------------------------------------------------
+
+-- | List the documents in a collection.
+--
+-- Returns the first page Firestore sends, which is capped server-side. For
+-- anything larger, or for a specific ordering, use 'runQuery'.
+listDocuments :: Firestore -> CollectionPath -> IO (Either FirestoreError [Document])
+listDocuments fs cp =
+  fmap (>>= decodeDocumentList) (doGet fs (collectionUrl (fsProject fs) cp))
+
+-- ---------------------------------------------------------------------------
 -- Queries
 -- ---------------------------------------------------------------------------
 
 -- | Run a structured query against the Firestore REST API.
-runQuery ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  StructuredQuery ->
-  IO (Either FirestoreError [Document])
-runQuery mgr tok pid sq =
-  fmap (>>= decodeQueryResults) (doPost mgr tok (queryUrl pid) body)
+runQuery :: Firestore -> StructuredQuery -> IO (Either FirestoreError [Document])
+runQuery fs sq =
+  fmap (>>= decodeQueryResults) (doPost fs (queryUrl (fsProject fs)) body)
   where
     body = Aeson.encode (encodeQuery sq)
 
@@ -172,39 +190,24 @@ runQuery mgr tok pid sq =
 -- ---------------------------------------------------------------------------
 
 -- | Begin a new transaction.
-beginTransaction ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  TransactionMode ->
-  IO (Either FirestoreError TransactionId)
-beginTransaction mgr tok pid mode =
-  fmap (>>= decodeTransactionId) (doPost mgr tok (beginTransactionUrl pid) body)
+beginTransaction :: Firestore -> TransactionMode -> IO (Either FirestoreError TransactionId)
+beginTransaction fs mode =
+  fmap (>>= decodeTransactionId) (doPost fs (beginTransactionUrl (fsProject fs)) body)
   where
     body = Aeson.encode (encodeTransactionOptions mode)
 
 -- | Commit a transaction with a list of write operations.
 commitTransaction ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  TransactionId ->
-  [Aeson.Value] ->
-  IO (Either FirestoreError ())
-commitTransaction mgr tok pid (TransactionId txnId) writes =
-  fmap void (doPost mgr tok (commitUrl pid) body)
+  Firestore -> TransactionId -> [Aeson.Value] -> IO (Either FirestoreError ())
+commitTransaction fs (TransactionId txnId) writes =
+  fmap void (doPost fs (commitUrl (fsProject fs)) body)
   where
     body = Aeson.encode (Aeson.object ["writes" .= writes, "transaction" .= txnId])
 
 -- | Roll back a transaction without committing.
-rollbackTransaction ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
-  TransactionId ->
-  IO (Either FirestoreError ())
-rollbackTransaction mgr tok pid (TransactionId txnId) =
-  fmap void (doPost mgr tok (rollbackUrl pid) body)
+rollbackTransaction :: Firestore -> TransactionId -> IO (Either FirestoreError ())
+rollbackTransaction fs (TransactionId txnId) =
+  fmap void (doPost fs (rollbackUrl (fsProject fs)) body)
   where
     body = Aeson.encode (Aeson.object ["transaction" .= txnId])
 
@@ -216,31 +219,29 @@ rollbackTransaction mgr tok pid (TransactionId txnId) =
 -- Use 'RetryWith' to retry an aborted transaction.
 --
 -- @
--- runTransaction mgr tok pid ReadWrite $ \\_txnId -> runExceptT $ do
---   doc <- ExceptT $ getDocument mgr tok pid somePath
---   pure [mkUpdateWrite pid somePath (bumpVersion (docFields doc))]
+-- runTransaction fs ReadWrite $ \\_txnId -> runExceptT $ do
+--   doc <- ExceptT $ getDocument fs somePath
+--   pure [mkUpdateWrite (fsProject fs) somePath (applyDebit 100 (docFields doc))]
 -- @
 runTransaction ::
-  Manager ->
-  AccessToken ->
-  ProjectId ->
+  Firestore ->
   TransactionMode ->
   (TransactionId -> IO (Either FirestoreError [Aeson.Value])) ->
   IO (Either FirestoreError ())
-runTransaction mgr tok pid mode action = do
-  started <- beginTransaction mgr tok pid mode
+runTransaction fs mode action = do
+  started <- beginTransaction fs mode
   either (pure . Left) commitOrRollback started
   where
     commitOrRollback txnId = do
       result <- runExceptT $ do
         writes <- ExceptT (action txnId)
-        ExceptT (commitTransaction mgr tok pid txnId writes)
+        ExceptT (commitTransaction fs txnId writes)
       either (rollbackWith txnId) (pure . Right) result
 
     -- The original failure is what the caller needs; a rollback that also
     -- fails must not mask it.
     rollbackWith txnId err = do
-      _ <- rollbackTransaction mgr tok pid txnId
+      _ <- rollbackTransaction fs txnId
       pure (Left err)
 
 -- ---------------------------------------------------------------------------
@@ -276,39 +277,30 @@ mkDeleteWrite pid dp =
 -- ---------------------------------------------------------------------------
 
 -- | Perform an authorized GET request.
-doGet ::
-  Manager -> AccessToken -> String -> IO (Either FirestoreError LBS.ByteString)
-doGet mgr tok url = doRequest mgr tok url methodGet Nothing
+doGet :: Firestore -> String -> IO (Either FirestoreError LBS.ByteString)
+doGet fs url = doRequest fs url methodGet Nothing
 
 -- | Perform an authorized POST request with a JSON body.
 doPost ::
-  Manager ->
-  AccessToken ->
-  String ->
-  LBS.ByteString ->
-  IO (Either FirestoreError LBS.ByteString)
-doPost mgr tok url body = doRequest mgr tok url methodPost (Just body)
+  Firestore -> String -> LBS.ByteString -> IO (Either FirestoreError LBS.ByteString)
+doPost fs url body = doRequest fs url methodPost (Just body)
 
 -- | Perform an authorized PATCH request with a JSON body.
 doPatch ::
-  Manager ->
-  AccessToken ->
-  String ->
-  LBS.ByteString ->
-  IO (Either FirestoreError LBS.ByteString)
-doPatch mgr tok url body = doRequest mgr tok url methodPatch (Just body)
+  Firestore -> String -> LBS.ByteString -> IO (Either FirestoreError LBS.ByteString)
+doPatch fs url body = doRequest fs url methodPatch (Just body)
 
 -- | Core HTTP request executor.
 doRequest ::
-  Manager ->
-  AccessToken ->
+  Firestore ->
   String ->
   Method ->
   Maybe LBS.ByteString ->
   IO (Either FirestoreError LBS.ByteString)
-doRequest mgr tok url httpMethod mBody = runExceptT $ do
+doRequest fs url httpMethod mBody = runExceptT $ do
   baseReq <- ExceptT (tryNetwork (parseRequest url))
-  resp <- ExceptT (tryNetwork (httpLbs (buildRequest tok httpMethod mBody baseReq) mgr))
+  let req = buildRequest (fsToken fs) httpMethod mBody baseReq
+  resp <- ExceptT (tryNetwork (httpLbs req (fsManager fs)))
   ExceptT (pure (responseOrError resp))
 
 -- | Run an action that may throw, reporting any exception as a network error.
@@ -345,6 +337,18 @@ responseOrError resp
 -- | Decode a response body, reporting parse failures as 'InvalidResponse'.
 decodeBody :: (Aeson.FromJSON a) => LBS.ByteString -> Either FirestoreError a
 decodeBody = first (InvalidResponse . T.pack) . Aeson.eitherDecode
+
+-- | Decode a @:list@ response. An empty collection omits @documents@.
+decodeDocumentList :: LBS.ByteString -> Either FirestoreError [Document]
+decodeDocumentList body = decodeBody body >>= documentsField
+  where
+    documentsField (Aeson.Object o) =
+      maybe (Right []) fromResult (KM.lookup "documents" o)
+    documentsField _ = Left (InvalidResponse "expected a JSON object")
+
+    fromResult value = case Aeson.fromJSON value of
+      Aeson.Success docs -> Right docs
+      Aeson.Error err -> Left (InvalidResponse (T.pack err))
 
 -- | Decode a query response: a stream of result objects, of which only some
 -- carry a document.

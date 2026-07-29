@@ -72,6 +72,7 @@ tests =
     [ authConfigTests,
       cacheControlTests,
       authErrorTests,
+      claimTests,
       bearerTokenTests,
       base64Tests,
       valueRoundtripTests,
@@ -125,11 +126,27 @@ cacheControlTests =
 -- Auth: Errors
 -- ---------------------------------------------------------------------------
 
+-- | A representative verified user, for checks that vary one field.
+testUser :: FirebaseUser
+testUser =
+  FirebaseUser
+    { fuUid = "uid1",
+      fuEmail = Just "a@b.com",
+      fuEmailVerified = True,
+      fuName = Just "Alice",
+      fuPicture = Nothing,
+      fuAuthTime = Nothing,
+      fuSignInProvider = Just "password",
+      fuCustomClaims = Map.fromList [("admin", Aeson.Bool True), ("tier", Aeson.String "gold")]
+    }
+
 authErrorTests :: [Test]
 authErrorTests =
   [ Test "FirebaseUser Eq instance" $
-      FirebaseUser "uid1" (Just "a@b.com") (Just "Alice")
-        `shouldBe` FirebaseUser "uid1" (Just "a@b.com") (Just "Alice"),
+      testUser `shouldBe` testUser,
+    Test "FirebaseUser Eq distinguishes custom claims" $
+      shouldHold "differing claims compare unequal" $
+        testUser /= testUser {fuCustomClaims = Map.empty},
     Test "AuthError constructors" $
       length
         [ KeyFetchError "network error",
@@ -149,6 +166,29 @@ authErrorTests =
     Test "authErrorMessage distinguishes signature from expiry" $
       shouldHold "different messages" $
         authErrorMessage InvalidSignature /= authErrorMessage TokenExpired
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Auth: Custom claims
+-- ---------------------------------------------------------------------------
+
+claimTests :: [Test]
+claimTests =
+  [ Test "lookupClaim finds a custom claim" $
+      lookupClaim "tier" testUser `shouldBe` Just (Aeson.String "gold"),
+    Test "lookupClaim misses an absent claim" $
+      lookupClaim "nope" testUser `shouldBe` Nothing,
+    Test "lookupClaim does not expose reserved claims" $
+      lookupClaim "email" testUser `shouldBe` Nothing,
+    Test "hasClaim accepts a true claim" $
+      shouldHold "admin holds" (hasClaim "admin" testUser),
+    Test "hasClaim rejects an absent claim" $
+      shouldHold "absent claim is false" (not (hasClaim "superuser" testUser)),
+    Test "hasClaim rejects a non-boolean claim" $
+      shouldHold "gold is not true" (not (hasClaim "tier" testUser)),
+    Test "hasClaim rejects a false claim" $
+      shouldHold "explicit false" $
+        not (hasClaim "admin" testUser {fuCustomClaims = Map.fromList [("admin", Aeson.Bool False)]})
   ]
 
 -- ---------------------------------------------------------------------------
@@ -218,6 +258,30 @@ valueRoundtripTests =
       roundtrip (ArrayValue [StringValue "a", IntegerValue 1, BoolValue True]),
     Test "FirestoreValue MapValue roundtrip" $
       roundtrip (MapValue (Map.fromList [("name", StringValue "Alice"), ("age", IntegerValue 30)])),
+    Test "FirestoreValue BytesValue roundtrip" $
+      roundtrip (BytesValue "\0\1\2binary\255"),
+    Test "FirestoreValue ReferenceValue roundtrip" $
+      roundtrip (ReferenceValue "projects/p/databases/(default)/documents/users/alice"),
+    Test "FirestoreValue GeoPointValue roundtrip" $
+      roundtrip (GeoPointValue (GeoPoint 51.5 (-0.12))),
+    Test "BytesValue encodes as base64" $
+      Aeson.encode (BytesValue "hello")
+        `shouldBe` Aeson.encode (Aeson.object ["bytesValue" Aeson..= ("aGVsbG8=" :: Text)]),
+    Test "BytesValue rejects invalid base64" $
+      (Aeson.decode "{\"bytesValue\":\"not!base64\"}" :: Maybe FirestoreValue) `shouldBe` Nothing,
+    Test "GeoPoint defaults an omitted coordinate to zero" $
+      (Aeson.decode "{\"geoPointValue\":{\"latitude\":10.5}}" :: Maybe FirestoreValue)
+        `shouldBe` Just (GeoPointValue (GeoPoint 10.5 0)),
+    Test "a document carrying a geo point decodes" $
+      fmap
+        docFields
+        ( Aeson.decode
+            "{\"name\":\"projects/p/databases/(default)/documents/c/d\"\
+            \,\"fields\":{\"where\":{\"geoPointValue\":{\"latitude\":1,\"longitude\":2}}}}"
+        )
+        `shouldBe` Just (Map.fromList [("where", GeoPointValue (GeoPoint 1 2))]),
+    Test "an unknown value tag is named in the error" $
+      (Aeson.decode "{\"nonsenseValue\":1}" :: Maybe FirestoreValue) `shouldBe` Nothing,
     Test "IntegerValue encodes as a JSON string" $
       Aeson.encode (IntegerValue 42)
         `shouldBe` Aeson.encode (Aeson.object ["integerValue" Aeson..= ("42" :: Text)]),

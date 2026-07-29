@@ -19,7 +19,7 @@ bug-reports:        https://github.com/Gondola-Bros-Entertainment/firebase-hs/is
 category:           Web, Authentication, Database
 stability:          experimental
 build-type:         Simple
-tested-with:        GHC == 9.8.4
+tested-with:        GHC ==9.6.* || ==9.8.* || ==9.10.* || ==9.12.*
 extra-doc-files:
     CHANGELOG.md
     README.md

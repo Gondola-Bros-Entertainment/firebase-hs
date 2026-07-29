@@ -12,6 +12,8 @@ module Firebase.Auth.Types
 
     -- * Authenticated User
     FirebaseUser (..),
+    lookupClaim,
+    hasClaim,
 
     -- * Errors
     AuthError (..),
@@ -29,11 +31,14 @@ where
 
 import Crypto.PubKey.RSA.Types (PublicKey (..))
 import Data.Aeson (FromJSON (..), Object, withObject, (.:))
+import qualified Data.Aeson as Aeson
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64URL
 import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (IORef)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -79,10 +84,39 @@ data FirebaseUser = FirebaseUser
     fuUid :: !Text,
     -- | Email address, if present in token claims.
     fuEmail :: !(Maybe Text),
+    -- | Whether Firebase considers the email address verified.
+    fuEmailVerified :: !Bool,
     -- | Display name, if present in token claims.
-    fuName :: !(Maybe Text)
+    fuName :: !(Maybe Text),
+    -- | Profile picture URL, if present in token claims.
+    fuPicture :: !(Maybe Text),
+    -- | When the user last authenticated, from the @auth_time@ claim.
+    -- Check this to require a recent login before a sensitive action.
+    fuAuthTime :: !(Maybe UTCTime),
+    -- | How the user signed in (@password@, @google.com@, @anonymous@, ...).
+    fuSignInProvider :: !(Maybe Text),
+    -- | Claims outside Firebase's reserved set, as assigned by the Admin
+    -- SDK's @setCustomUserClaims@. This is where roles and permissions live.
+    fuCustomClaims :: !(Map Text Aeson.Value)
   }
   deriving (Eq, Show)
+
+-- | Look up a custom claim by name.
+--
+-- Reserved claims are not included; read those through the dedicated
+-- fields.
+lookupClaim :: Text -> FirebaseUser -> Maybe Aeson.Value
+lookupClaim name = Map.lookup name . fuCustomClaims
+
+-- | Whether a custom claim is present and exactly @true@.
+--
+-- The usual shape of a Firebase role check:
+--
+-- @
+-- if hasClaim \"admin\" user then handleAdmin else refuse
+-- @
+hasClaim :: Text -> FirebaseUser -> Bool
+hasClaim name user = lookupClaim name user == Just (Aeson.Bool True)
 
 -- ---------------------------------------------------------------------------
 -- Errors

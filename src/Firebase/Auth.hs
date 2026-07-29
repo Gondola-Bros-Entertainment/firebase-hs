@@ -34,6 +34,8 @@ module Firebase.Auth
 
     -- * Authenticated user
     FirebaseUser (..),
+    lookupClaim,
+    hasClaim,
 
     -- * Errors
     AuthError (..),
@@ -49,8 +51,11 @@ import Control.Monad (guard)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.PubKey.RSA.PKCS15 (verify)
 import Crypto.PubKey.RSA.Types (PublicKey)
-import Data.Aeson (FromJSON (..), (.:), (.:?))
+import Data.Aeson (FromJSON (..), (.!=), (.:), (.:?))
 import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Types as Aeson
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64URL
@@ -58,6 +63,10 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (find)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
@@ -96,8 +105,13 @@ data JwtPayload = JwtPayload
     jpAud :: !(Maybe Text),
     jpExp :: !(Maybe Integer),
     jpIat :: !(Maybe Integer),
+    jpAuthTime :: !(Maybe Integer),
     jpEmail :: !(Maybe Text),
-    jpName :: !(Maybe Text)
+    jpEmailVerified :: !Bool,
+    jpName :: !(Maybe Text),
+    jpPicture :: !(Maybe Text),
+    jpSignInProvider :: !(Maybe Text),
+    jpCustomClaims :: !(Map Text Aeson.Value)
   }
 
 instance FromJSON JwtPayload where
@@ -108,8 +122,59 @@ instance FromJSON JwtPayload where
       <*> o .:? "aud"
       <*> o .:? "exp"
       <*> o .:? "iat"
+      <*> o .:? "auth_time"
       <*> o .:? "email"
+      <*> o .:? "email_verified" .!= False
       <*> o .:? "name"
+      <*> o .:? "picture"
+      <*> parseSignInProvider o
+      <*> pure (customClaims o)
+
+-- | Read @firebase.sign_in_provider@ out of the nested Firebase claim.
+parseSignInProvider :: Aeson.Object -> Aeson.Parser (Maybe Text)
+parseSignInProvider o =
+  o .:? "firebase"
+    >>= maybe (pure Nothing) (Aeson.withObject "firebase" (.:? "sign_in_provider"))
+
+-- | Claim names Firebase reserves, which 'setCustomUserClaims' may not set.
+--
+-- Everything outside this set is a custom claim and is surfaced as one.
+reservedClaims :: Set Text
+reservedClaims =
+  Set.fromList
+    [ "acr",
+      "amr",
+      "at_hash",
+      "aud",
+      "auth_time",
+      "azp",
+      "c_hash",
+      "cnf",
+      "exp",
+      "email",
+      "email_verified",
+      "firebase",
+      "iat",
+      "iss",
+      "jti",
+      "name",
+      "nbf",
+      "nonce",
+      "phone_number",
+      "picture",
+      "sub",
+      "user_id"
+    ]
+
+-- | Every claim outside 'reservedClaims'.
+customClaims :: Aeson.Object -> Map Text Aeson.Value
+customClaims payload =
+  Map.fromList
+    [ (name, value)
+    | (key, value) <- KM.toList payload,
+      let name = Key.toText key,
+      not (Set.member name reservedClaims)
+    ]
 
 -- | The three dot-separated parts of a compact JWT, still base64url-encoded.
 data JwtParts = JwtParts
@@ -381,5 +446,10 @@ extractUser payload =
             FirebaseUser
               { fuUid = sub,
                 fuEmail = jpEmail payload,
-                fuName = jpName payload
+                fuEmailVerified = jpEmailVerified payload,
+                fuName = jpName payload,
+                fuPicture = jpPicture payload,
+                fuAuthTime = posixSecondsToUTCTime . fromInteger <$> jpAuthTime payload,
+                fuSignInProvider = jpSignInProvider payload,
+                fuCustomClaims = jpCustomClaims payload
               }
