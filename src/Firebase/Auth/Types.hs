@@ -51,7 +51,7 @@ import Network.HTTP.Client (Manager)
 
 -- | Configuration for Firebase ID token verification.
 data FirebaseConfig = FirebaseConfig
-  { -- | Firebase project ID (e.g. @\"gondola-bros-hub\"@).
+  { -- | Firebase project ID (e.g. @\"my-project-id\"@).
     fcProjectId :: !Text,
     -- | Maximum allowed clock skew between server and Google.
     -- Default: 300 seconds.
